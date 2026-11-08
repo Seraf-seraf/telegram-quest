@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.vercel/
+dist/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+.codex-task-state.md
