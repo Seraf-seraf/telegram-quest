@@ -16,6 +16,13 @@ describe("loadWebhookConfig", () => {
 
   it.each([
     [{ TELEGRAM_WEBHOOK_SECRET: "valid_secret-123" }, "TELEGRAM_BOT_TOKEN"],
+    [
+      {
+        TELEGRAM_BOT_TOKEN: "",
+        TELEGRAM_WEBHOOK_SECRET: "valid_secret-123",
+      },
+      "TELEGRAM_BOT_TOKEN",
+    ],
     [{ TELEGRAM_BOT_TOKEN: "123456:bot-token" }, "TELEGRAM_WEBHOOK_SECRET"],
     [
       {
@@ -37,8 +44,14 @@ describe("loadWebhookConfig", () => {
       throw new Error("Expected invalid configuration to be rejected.");
     } catch (error) {
       expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toContain(name);
-      expect((error as Error).message).not.toContain("invalid/secret");
+      const message = (error as Error).message;
+      expect(message).toContain(name);
+
+      for (const value of Object.values(env)) {
+        if (value.length > 0) {
+          expect(message).not.toContain(value);
+        }
+      }
     }
   });
 
