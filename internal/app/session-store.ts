@@ -70,6 +70,30 @@ export interface CompletedSessionStart {
 
 export type StartSessionRecord = ActiveSessionStart | CompletedSessionStart;
 
+export interface ActiveDecisionResult {
+  kind: "active";
+  nextTurn: InitialTurnRecord;
+}
+
+export interface CompletedDecisionResult {
+  kind: "completed";
+  finalScene: FinalScene;
+}
+
+export interface ApplyDecisionRecord {
+  sessionId: string;
+  owner: SessionOwner;
+  questVersionId: string;
+  storyHash: string;
+  expectedStateVersion: number;
+  turnId: string;
+  choiceIndex: number;
+  operationId: number;
+  processedAtMs: number;
+  inkState: string;
+  result: ActiveDecisionResult | CompletedDecisionResult;
+}
+
 export interface SessionStore {
   /** Atomically records the operation and inserts a created session. */
   createSession(input: CreateSessionRecord): Promise<Session>;
@@ -79,4 +103,8 @@ export interface SessionStore {
   listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]>;
   /** Compares owner, pinned version and state version, then persists state and the first turn atomically. */
   startSession(input: StartSessionRecord): Promise<Session>;
+  /** Checks the globally unique Telegram update ID before an ambiguous decision is retried. */
+  hasProcessedOperation(operationId: number): Promise<boolean>;
+  /** Rechecks the current turn and atomically records the decision, next state and operation ID. */
+  applyDecision(input: ApplyDecisionRecord): Promise<Session>;
 }

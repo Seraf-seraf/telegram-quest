@@ -10,6 +10,7 @@ import type {
 } from "../../domain/model.js";
 import {
   SessionError,
+  type ApplyDecisionRecord,
   type CreateSessionRecord,
   type SessionQuestVersion,
   type SessionStore,
@@ -442,6 +443,76 @@ function validateCompletedStart(
   }
 }
 
+function validateDecision(input: ApplyDecisionRecord): void {
+  if (
+    !Number.isSafeInteger(input.expectedStateVersion) ||
+    input.expectedStateVersion < 0 ||
+    !Number.isSafeInteger(input.choiceIndex) ||
+    input.choiceIndex < 0 ||
+    !Number.isSafeInteger(input.operationId) ||
+    input.operationId < 0 ||
+    !Number.isSafeInteger(input.processedAtMs) ||
+    input.processedAtMs < 0 ||
+    input.sessionId.length === 0 ||
+    input.turnId.length === 0 ||
+    input.questVersionId.length === 0 ||
+    !/^[a-f\d]{64}$/i.test(input.storyHash) ||
+    !isJsonObject(input.inkState)
+  ) {
+    throw new SessionError("INVALID_TRANSITION", "Decision record is invalid.");
+  }
+
+  if (input.result.kind === "active") {
+    const { turn } = input.result.nextTurn;
+    if (
+      turn.id.length === 0 ||
+      !Number.isSafeInteger(turn.stepNumber) ||
+      turn.stepNumber < 2 ||
+      turn.decision !== null ||
+      !isJsonObject(turn.inkCheckpoint) ||
+      turn.inkCheckpoint !== input.inkState ||
+      typeof turn.sceneText !== "string" ||
+      turn.choices.length === 0 ||
+      turn.choices.some((choice) =>
+        !Number.isSafeInteger(choice.index) ||
+        choice.index < 0 ||
+        choice.index >= turn.choices.length ||
+        typeof choice.text !== "string" ||
+        !Array.isArray(choice.tags) ||
+        choice.tags.some((tag) => typeof tag !== "string")
+      )
+    ) {
+      throw new SessionError("INVALID_TRANSITION", "Next decision turn is invalid.");
+    }
+
+    if (input.owner.type === "group") {
+      const { voteDurationMs, defaultChoiceIndex } = input.result.nextTurn;
+      if (
+        voteDurationMs === null ||
+        !Number.isSafeInteger(voteDurationMs) ||
+        voteDurationMs <= 0 ||
+        defaultChoiceIndex === null ||
+        !Number.isSafeInteger(defaultChoiceIndex) ||
+        !turn.choices.some((choice) => choice.index === defaultChoiceIndex)
+      ) {
+        throw new SessionError("INVALID_TRANSITION", "Group turn policy is invalid.");
+      }
+    } else if (
+      input.result.nextTurn.voteDurationMs !== null ||
+      input.result.nextTurn.defaultChoiceIndex !== null
+    ) {
+      throw new SessionError("INVALID_TRANSITION", "Personal turns cannot have a vote policy.");
+    }
+  } else if (
+    !isJsonObject(input.inkState) ||
+    typeof input.result.finalScene.text !== "string" ||
+    !Array.isArray(input.result.finalScene.tags) ||
+    input.result.finalScene.tags.some((tag) => typeof tag !== "string")
+  ) {
+    throw new SessionError("INVALID_TRANSITION", "Final story output is invalid.");
+  }
+}
+
 export function createTursoSessionStore(database: TursoDatabase): SessionStore {
   async function inRead<T>(operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     try {
@@ -599,6 +670,156 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
             JSON.stringify(turn.choices),
             input.initialTurn.defaultChoiceIndex,
             input.initialTurn.voteDurationMs,
+          );
+        }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async hasProcessedOperation(operationId: number): Promise<boolean> {
+      if (!Number.isSafeInteger(operationId) || operationId < 0) {
+        throw new SessionError("INVALID_TRANSITION", "Operation ID is invalid.");
+      }
+
+      return inRead(async (executor) => (await executor.get(
+        "SELECT update_id FROM processed_update WHERE update_id = ?",
+        operationId,
+      )) !== undefined);
+    },
+
+    async applyDecision(input: ApplyDecisionRecord): Promise<Session> {
+      validateDecision(input);
+
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        const processed = await executor.get(
+          "SELECT update_id FROM processed_update WHERE update_id = ?",
+          input.operationId,
+        );
+        if (processed !== undefined) {
+          throw new SessionError("DUPLICATE_OPERATION", "Operation was already processed.");
+        }
+
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        if (readStatus(sessionRow) !== "active") {
+          throw new SessionError("INVALID_TRANSITION", "Session cannot accept a decision.");
+        }
+
+        if (readString(sessionRow, "quest_version_id") !== input.questVersionId) {
+          throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+        }
+
+        const latestVersion = await readQuestVersion(executor, input.questVersionId);
+        if (latestVersion === null) {
+          throw new SessionError("NOT_FOUND", "Quest version was not found.");
+        }
+        if (
+          latestVersion.questVersion.id !== input.questVersionId ||
+          latestVersion.questVersion.storyHash.toLowerCase() !== input.storyHash.toLowerCase()
+        ) {
+          throw new SessionError("STORY_MISMATCH", "Quest version changed while it was loading.");
+        }
+
+        const currentSession = await readSession(executor, input.owner, input.sessionId);
+        const currentTurn = currentSession.turns[0];
+        if (currentTurn === undefined || currentTurn.id !== input.turnId) {
+          throw new SessionError("INVALID_TRANSITION", "Turn is no longer current.");
+        }
+        if (currentTurn.decision !== null) {
+          throw new SessionError("INVALID_TRANSITION", "Turn already has a decision.");
+        }
+        if (
+          currentSession.inkState === null ||
+          currentSession.inkState !== currentTurn.inkCheckpoint
+        ) {
+          throw new SessionError("STORY_MISMATCH", "Saved Ink state does not match the current turn.");
+        }
+        if (!currentTurn.choices.some((choice) => choice.index === input.choiceIndex)) {
+          throw new SessionError("INVALID_CHOICE", "Choice is not available.");
+        }
+
+        if (
+          input.result.kind === "active" &&
+          input.result.nextTurn.turn.stepNumber !== currentTurn.stepNumber + 1
+        ) {
+          throw new SessionError("STORY_MISMATCH", "Next turn number does not follow the current turn.");
+        }
+
+        try {
+          await executor.run(
+            "INSERT INTO processed_update (update_id, processed_at_ms) VALUES (?, ?)",
+            input.operationId,
+            input.processedAtMs,
+          );
+        } catch (error) {
+          if (isConstraintViolation(error)) {
+            throw new SessionError("DUPLICATE_OPERATION", "Operation was already processed.");
+          }
+          throw error;
+        }
+
+        const decidedTurn = await executor.get(
+          `UPDATE turn
+              SET decision_choice_index = ?
+            WHERE id = ? AND session_id = ? AND decision_choice_index IS NULL
+          RETURNING id`,
+          input.choiceIndex,
+          input.turnId,
+          input.sessionId,
+        );
+        if (decidedTurn === undefined) {
+          throw new SessionError("INVALID_TRANSITION", "Turn is no longer current.");
+        }
+
+        const completed = input.result.kind === "completed";
+        const finalScene = input.result.kind === "completed" ? input.result.finalScene : null;
+        const updated = await executor.get(
+          `UPDATE session
+              SET status = ?,
+                  ink_state_json = ?,
+                  state_version = state_version + 1,
+                  outcome = ?,
+                  final_scene_text = ?,
+                  final_scene_tags_json = ?
+            WHERE id = ? AND owner_type = ? AND owner_id = ?
+              AND status = 'active' AND state_version = ?
+              AND ink_state_json = ?
+          RETURNING id`,
+          completed ? "completed" : "active",
+          input.inkState,
+          completed ? "story_completed" : null,
+          finalScene?.text ?? null,
+          finalScene === null ? null : JSON.stringify(finalScene.tags),
+          input.sessionId,
+          input.owner.type,
+          input.owner.id,
+          input.expectedStateVersion,
+          currentTurn.inkCheckpoint,
+        );
+        if (updated === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        if (input.result.kind === "active") {
+          const turn = input.result.nextTurn.turn;
+          await executor.run(
+            `INSERT INTO turn (
+               id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+               default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
+               interactive_message_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+            turn.id,
+            input.sessionId,
+            turn.stepNumber,
+            turn.inkCheckpoint,
+            turn.sceneText,
+            JSON.stringify(turn.choices),
+            input.result.nextTurn.defaultChoiceIndex,
+            input.result.nextTurn.voteDurationMs,
           );
         }
 

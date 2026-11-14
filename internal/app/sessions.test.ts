@@ -13,6 +13,7 @@ import {
   SessionError,
   type SessionStore,
   type SessionErrorCode,
+  type ApplyDecisionRecord,
   type StartSessionRecord,
 } from "./session-store.js";
 import { SessionService } from "./sessions.js";
@@ -64,18 +65,37 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
+function makeActiveSession(owner: SessionOwner = userOwner): Session {
+  const step = new InkStoryRuntime().start(compiledStoryJson);
+  return makeSession({
+    owner,
+    status: "active",
+    inkState: step.stateJson,
+    stateVersion: 1,
+    turns: [makeTurn({
+      inkCheckpoint: step.stateJson,
+      sceneText: step.text,
+      choices: step.choices,
+    })],
+  });
+}
+
 function makeStore(options: {
   session?: Session;
   questAvailable?: boolean;
   questVersionExists?: boolean;
+  processedOperationIds?: number[];
 } = {}): SessionStore & {
   getQuestVersion: ReturnType<typeof vi.fn>;
   getSession: ReturnType<typeof vi.fn>;
   listTurns: ReturnType<typeof vi.fn>;
   startSession: ReturnType<typeof vi.fn>;
   createSession: ReturnType<typeof vi.fn>;
+  hasProcessedOperation: ReturnType<typeof vi.fn>;
+  applyDecision: ReturnType<typeof vi.fn>;
 } {
   let currentSession = options.session ?? makeSession();
+  const processedOperationIds = new Set(options.processedOperationIds ?? []);
   const createSession = vi.fn(async (input) => makeSession({
     id: input.sessionId,
     owner: input.owner,
@@ -129,6 +149,48 @@ function makeStore(options: {
     };
     return currentSession;
   });
+  const hasProcessedOperation = vi.fn(async (operationId: number) =>
+    processedOperationIds.has(operationId));
+  const applyDecision = vi.fn(async (input: ApplyDecisionRecord) => {
+    if (processedOperationIds.has(input.operationId)) {
+      throw new SessionError("DUPLICATE_OPERATION", "Operation was already processed.");
+    }
+
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+
+    if (currentSession.status !== "active") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot accept a decision.");
+    }
+
+    const currentTurn = currentSession.turns.at(-1);
+    if (currentTurn === undefined || currentTurn.id !== input.turnId) {
+      throw new SessionError("INVALID_TRANSITION", "Turn is no longer current.");
+    }
+
+    if (!currentTurn.choices.some((choice) => choice.index === input.choiceIndex)) {
+      throw new SessionError("INVALID_CHOICE", "Choice is not available.");
+    }
+
+    processedOperationIds.add(input.operationId);
+    const decidedTurn = { ...currentTurn, decision: { choiceIndex: input.choiceIndex } };
+    const turns = [
+      ...currentSession.turns.slice(0, -1),
+      decidedTurn,
+      ...(input.result.kind === "active" ? [input.result.nextTurn.turn] : []),
+    ];
+    currentSession = {
+      ...currentSession,
+      status: input.result.kind === "completed" ? "completed" : "active",
+      inkState: input.inkState,
+      stateVersion: currentSession.stateVersion + 1,
+      turns,
+      outcome: input.result.kind === "completed" ? "story_completed" : null,
+      finalScene: input.result.kind === "completed" ? input.result.finalScene : null,
+    };
+    return currentSession;
+  });
 
   return {
     createSession,
@@ -136,6 +198,8 @@ function makeStore(options: {
     getSession,
     listTurns,
     startSession,
+    hasProcessedOperation,
+    applyDecision,
   };
 }
 
@@ -500,6 +564,214 @@ describe("SessionService", () => {
     expect(turns).toEqual([openTurn]);
     expect(runtime.start).not.toHaveBeenCalled();
     expect(runtime.choose).not.toHaveBeenCalled();
+  });
+
+  it("applies a choice from the stored checkpoint and persists the next decision point", async () => {
+    const initialSession = makeActiveSession();
+    const store = makeStore({ session: initialSession });
+    const runtime = new InkStoryRuntime();
+    const choose = vi.spyOn(runtime, "choose");
+    const { service } = makeService({
+      store,
+      storyRuntime: runtime,
+      ids: ["next-turn"],
+    });
+
+    const session = await service.applyDecision(
+      userOwner,
+      initialSession.id,
+      initialSession.turns[0]!.id,
+      0,
+      initialSession.stateVersion,
+      601,
+    );
+
+    expect(choose).toHaveBeenCalledWith(
+      compiledStoryJson.replace(/^\uFEFF/, ""),
+      initialSession.turns[0]!.inkCheckpoint,
+      0,
+    );
+    expect(session).toMatchObject({
+      status: "active",
+      stateVersion: 2,
+      turns: [
+        { id: initialSession.turns[0]!.id, decision: { choiceIndex: 0 } },
+        { id: "next-turn", stepNumber: 2, decision: null },
+      ],
+    });
+    expect(store.applyDecision).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: 601,
+      expectedStateVersion: 1,
+      turnId: initialSession.turns[0]!.id,
+      choiceIndex: 0,
+      inkState: session.inkState,
+      result: expect.objectContaining({ kind: "active" }),
+    }));
+  });
+
+  it("requires and persists a trusted policy for the next open group turn", async () => {
+    const initialSession = makeActiveSession(groupOwner);
+    const withoutPolicyStore = makeStore({ session: initialSession });
+    const withoutPolicy = makeService({ store: withoutPolicyStore, owner: groupOwner });
+
+    await expectSessionError(
+      withoutPolicy.service.applyDecision(
+        groupOwner,
+        initialSession.id,
+        initialSession.turns[0]!.id,
+        0,
+        initialSession.stateVersion,
+        607,
+      ),
+      "INVALID_TRANSITION",
+    );
+    expect(withoutPolicyStore.applyDecision).not.toHaveBeenCalled();
+
+    const withPolicyStore = makeStore({ session: initialSession });
+    const withPolicy = makeService({ store: withPolicyStore, owner: groupOwner });
+    await withPolicy.service.applyDecision(
+      groupOwner,
+      initialSession.id,
+      initialSession.turns[0]!.id,
+      0,
+      initialSession.stateVersion,
+      608,
+      { voteDurationMs: 45_000, defaultChoiceIndex: 1 },
+    );
+
+    expect(withPolicyStore.applyDecision).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({
+        kind: "active",
+        nextTurn: expect.objectContaining({
+          voteDurationMs: 45_000,
+          defaultChoiceIndex: 1,
+        }),
+      }),
+    }));
+  });
+
+  it("rejects stale turns, unavailable choices and corrupt checkpoints before executing Ink", async () => {
+    const staleTurnSession = makeActiveSession();
+    const staleRuntime = new InkStoryRuntime();
+    const staleChoose = vi.spyOn(staleRuntime, "choose");
+    const stale = makeService({
+      store: makeStore({ session: staleTurnSession }),
+      storyRuntime: staleRuntime,
+    });
+    await expectSessionError(
+      stale.service.applyDecision(
+        userOwner,
+        staleTurnSession.id,
+        "old-turn",
+        0,
+        staleTurnSession.stateVersion,
+        602,
+      ),
+      "INVALID_TRANSITION",
+    );
+
+    const choiceSession = makeActiveSession();
+    const choiceRuntime = new InkStoryRuntime();
+    const choiceChoose = vi.spyOn(choiceRuntime, "choose");
+    const invalidChoice = makeService({
+      store: makeStore({ session: choiceSession }),
+      storyRuntime: choiceRuntime,
+    });
+    await expectSessionError(
+      invalidChoice.service.applyDecision(
+        userOwner,
+        choiceSession.id,
+        choiceSession.turns[0]!.id,
+        2,
+        choiceSession.stateVersion,
+        603,
+      ),
+      "INVALID_CHOICE",
+    );
+
+    const corruptSession = makeActiveSession();
+    corruptSession.turns[0]!.inkCheckpoint = "{}";
+    const corruptRuntime = new InkStoryRuntime();
+    const corruptChoose = vi.spyOn(corruptRuntime, "choose");
+    const corrupt = makeService({
+      store: makeStore({ session: corruptSession }),
+      storyRuntime: corruptRuntime,
+    });
+    await expectSessionError(
+      corrupt.service.applyDecision(
+        userOwner,
+        corruptSession.id,
+        corruptSession.turns[0]!.id,
+        0,
+        corruptSession.stateVersion,
+        604,
+      ),
+      "STORY_MISMATCH",
+    );
+
+    expect(staleChoose).not.toHaveBeenCalled();
+    expect(choiceChoose).not.toHaveBeenCalled();
+    expect(corruptChoose).not.toHaveBeenCalled();
+  });
+
+  it("reads an already processed operation before rerunning Ink", async () => {
+    const session = makeActiveSession();
+    const store = makeStore({ session, processedOperationIds: [605] });
+    const runtime = new InkStoryRuntime();
+    const choose = vi.spyOn(runtime, "choose");
+    const { service } = makeService({ store, storyRuntime: runtime });
+
+    await expectSessionError(
+      service.applyDecision(
+        userOwner,
+        session.id,
+        session.turns[0]!.id,
+        0,
+        session.stateVersion,
+        605,
+      ),
+      "DUPLICATE_OPERATION",
+    );
+
+    expect(store.hasProcessedOperation).toHaveBeenCalledWith(605);
+    expect(choose).not.toHaveBeenCalled();
+  });
+
+  it("stores the final Ink scene and tags after a decision ends the story", async () => {
+    const runtime = new InkStoryRuntime();
+    const firstStep = runtime.start(compiledStoryJson);
+    const secondStep = runtime.choose(compiledStoryJson, firstStep.stateJson, 0);
+    const session = makeSession({
+      status: "active",
+      inkState: secondStep.stateJson,
+      stateVersion: 2,
+      turns: [makeTurn({
+        id: "turn-2",
+        stepNumber: 2,
+        inkCheckpoint: secondStep.stateJson,
+        sceneText: secondStep.text,
+        choices: secondStep.choices,
+      })],
+    });
+    const store = makeStore({ session });
+    const { service } = makeService({ store, storyRuntime: runtime });
+
+    const completed = await service.applyDecision(
+      userOwner,
+      session.id,
+      "turn-2",
+      0,
+      session.stateVersion,
+      606,
+    );
+
+    expect(completed).toMatchObject({
+      status: "completed",
+      stateVersion: 3,
+      outcome: "story_completed",
+      finalScene: { text: "The left road leads home.\n", tags: ["ending:left"] },
+      turns: [{ id: "turn-2", decision: { choiceIndex: 0 } }],
+    });
   });
 
   it("keeps owner, transition and expected-state failures distinct", async () => {

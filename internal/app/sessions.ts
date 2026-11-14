@@ -7,6 +7,7 @@ import type {
 } from "../domain/model.js";
 import {
   SessionError,
+  type ApplyDecisionRecord,
   type SessionStore,
 } from "./session-store.js";
 import { StoryRuntimeError, type StoryRuntime, type StoryStep } from "./story.js";
@@ -176,53 +177,12 @@ export class SessionService {
       throw new SessionError("INVALID_TRANSITION", "Session cannot be started.");
     }
 
-    const versionDetails = await this.store.getQuestVersion(session.questVersionId);
-
-    if (versionDetails === null) {
-      throw new SessionError("NOT_FOUND", "Quest version was not found.");
-    }
-
-    if (versionDetails.questVersion.id !== session.questVersionId) {
-      throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
-    }
-
-    if (!versionDetails.questAvailable) {
-      throw new SessionError("INVALID_TRANSITION", "Quest is not available.");
-    }
-
-    const pinnedStoryHash = versionDetails.questVersion.storyHash;
-    if (!/^[a-f\d]{64}$/i.test(pinnedStoryHash)) {
-      throw new SessionError("STORY_MISMATCH", "Quest version has an invalid content hash.");
-    }
-    const sourceVersion = { ...versionDetails.questVersion };
-
-    let compiledStoryJson: string;
-
-    try {
-      compiledStoryJson = await this.storySource.load(sourceVersion);
-    } catch (error) {
-      if (error instanceof StorySourceError) {
-        throw new SessionError(error.code, "Quest story could not be loaded.", { cause: error });
-      }
-
-      throw new SessionError("STORAGE_FAILURE", "Quest story could not be loaded.", { cause: error });
-    }
-
-    if (typeof compiledStoryJson !== "string") {
-      throw new SessionError("STORY_MISMATCH", "Quest story source returned invalid content.");
-    }
-
-    const normalizedStoryJson = compiledStoryJson.replace(/^\uFEFF/, "");
-    const actualStoryHash = createHash("sha256").update(normalizedStoryJson).digest("hex");
-
-    if (actualStoryHash !== pinnedStoryHash.toLowerCase()) {
-      throw new SessionError("STORY_MISMATCH", "Quest story does not match its stored version.");
-    }
+    const pinnedStory = await this.loadPinnedStory(session.questVersionId, true);
 
     let step: StoryStep;
 
     try {
-      step = this.storyRuntime.start(normalizedStoryJson);
+      step = this.storyRuntime.start(pinnedStory.compiledStoryJson);
     } catch (error) {
       const message = error instanceof StoryRuntimeError && error.code === "INVALID_STORY"
         ? "Quest story is not a valid compiled Ink story."
@@ -242,7 +202,7 @@ export class SessionService {
         sessionId,
         owner,
         questVersionId: session.questVersionId,
-        storyHash: pinnedStoryHash,
+        storyHash: pinnedStory.storyHash,
         expectedStateVersion,
         inkState: step.stateJson,
         finalScene: { text: step.text, tags: [...step.tags] },
@@ -295,10 +255,184 @@ export class SessionService {
       sessionId,
       owner,
       questVersionId: session.questVersionId,
-      storyHash: pinnedStoryHash,
+      storyHash: pinnedStory.storyHash,
       expectedStateVersion,
       inkState: step.stateJson,
       initialTurn,
+    });
+  }
+
+  public async applyDecision(
+    owner: SessionOwner,
+    sessionId: string,
+    turnId: string,
+    choiceIndex: number,
+    expectedStateVersion: number,
+    operationId: number,
+    groupPolicy?: GroupTurnPolicy,
+  ): Promise<Session> {
+    assertOwner(owner);
+    assertNonNegativeSafeInteger(expectedStateVersion, "Expected state version");
+    assertNonNegativeSafeInteger(operationId, "Operation ID");
+
+    if (
+      typeof sessionId !== "string" ||
+      sessionId.length === 0 ||
+      sessionId.trim() !== sessionId ||
+      typeof turnId !== "string" ||
+      turnId.length === 0 ||
+      turnId.trim() !== turnId
+    ) {
+      throw new SessionError("INVALID_TRANSITION", "Session or turn ID is invalid.");
+    }
+
+    if (!Number.isSafeInteger(choiceIndex) || choiceIndex < 0) {
+      throw new SessionError("INVALID_CHOICE", "Choice is not available.");
+    }
+
+    const session = await this.store.getSession(owner, sessionId);
+
+    if (await this.store.hasProcessedOperation(operationId)) {
+      throw new SessionError("DUPLICATE_OPERATION", "Operation was already processed.");
+    }
+
+    if (session.stateVersion !== expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+
+    if (session.status !== "active") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot accept a decision.");
+    }
+
+    if (session.turns.length !== 1) {
+      throw new SessionError("STORY_MISMATCH", "Active session has no unique current turn.");
+    }
+
+    const currentTurn = session.turns[0]!;
+    if (currentTurn.id !== turnId || currentTurn.decision !== null) {
+      throw new SessionError("INVALID_TRANSITION", "Turn is no longer current.");
+    }
+
+    if (
+      session.inkState === null ||
+      !isJsonObject(session.inkState) ||
+      !isJsonObject(currentTurn.inkCheckpoint) ||
+      session.inkState !== currentTurn.inkCheckpoint
+    ) {
+      throw new SessionError("STORY_MISMATCH", "Saved Ink state does not match the current turn.");
+    }
+
+    if (!currentTurn.choices.some((choice) => choice.index === choiceIndex)) {
+      throw new SessionError("INVALID_CHOICE", "Choice is not available.");
+    }
+
+    const pinnedStory = await this.loadPinnedStory(session.questVersionId, false);
+    let step: StoryStep;
+
+    try {
+      step = this.storyRuntime.choose(
+        pinnedStory.compiledStoryJson,
+        currentTurn.inkCheckpoint,
+        choiceIndex,
+      );
+    } catch (error) {
+      if (error instanceof StoryRuntimeError && error.code === "INVALID_CHOICE") {
+        throw new SessionError("INVALID_CHOICE", "Choice is not available.", { cause: error });
+      }
+
+      if (error instanceof StoryRuntimeError && error.code === "STORY_ENDED") {
+        throw new SessionError("INVALID_TRANSITION", "Story has no current decision.", {
+          cause: error,
+        });
+      }
+
+      throw new SessionError("STORY_MISMATCH", "Saved story state could not be advanced.", {
+        cause: error,
+      });
+    }
+
+    assertStoryStep(step);
+
+    if (!step.ended && step.choices.length === 0) {
+      throw new SessionError("STORY_MISMATCH", "Story has no choice at its next decision point.");
+    }
+
+    const processedAtMs = this.now();
+    assertNonNegativeSafeInteger(processedAtMs, "Current time");
+
+    let result: ApplyDecisionRecord["result"];
+    if (step.ended) {
+      result = {
+        kind: "completed",
+        finalScene: { text: step.text, tags: [...step.tags] },
+      };
+    } else {
+      let voteDurationMs: number | null = null;
+      let defaultChoiceIndex: number | null = null;
+
+      if (owner.type === "group") {
+        if (groupPolicy === undefined) {
+          throw new SessionError(
+            "INVALID_TRANSITION",
+            "A group turn requires a trusted vote policy.",
+          );
+        }
+
+        if (!Number.isSafeInteger(groupPolicy.voteDurationMs) || groupPolicy.voteDurationMs <= 0) {
+          throw new SessionError("INVALID_TRANSITION", "Group vote duration is invalid.");
+        }
+
+        if (
+          !Number.isSafeInteger(groupPolicy.defaultChoiceIndex) ||
+          groupPolicy.defaultChoiceIndex < 0 ||
+          groupPolicy.defaultChoiceIndex >= step.choices.length ||
+          !step.choices.some((choice) => choice.index === groupPolicy.defaultChoiceIndex)
+        ) {
+          throw new SessionError("INVALID_CHOICE", "Group default choice is not available.");
+        }
+
+        voteDurationMs = groupPolicy.voteDurationMs;
+        defaultChoiceIndex = groupPolicy.defaultChoiceIndex;
+      }
+
+      if (!Number.isSafeInteger(currentTurn.stepNumber) || currentTurn.stepNumber < 1) {
+        throw new SessionError("STORY_MISMATCH", "Current turn number is invalid.");
+      }
+
+      const stepNumber = currentTurn.stepNumber + 1;
+      if (!Number.isSafeInteger(stepNumber)) {
+        throw new SessionError("STORY_MISMATCH", "Next turn number is invalid.");
+      }
+
+      result = {
+        kind: "active",
+        nextTurn: {
+          turn: {
+            id: createId(this.newId, "Turn ID"),
+            stepNumber,
+            inkCheckpoint: step.stateJson,
+            sceneText: step.text,
+            choices: step.choices.map(cloneChoice),
+            decision: null,
+          },
+          voteDurationMs,
+          defaultChoiceIndex,
+        },
+      };
+    }
+
+    return this.store.applyDecision({
+      sessionId,
+      owner,
+      questVersionId: session.questVersionId,
+      storyHash: pinnedStory.storyHash,
+      expectedStateVersion,
+      turnId,
+      choiceIndex,
+      operationId,
+      processedAtMs,
+      inkState: step.stateJson,
+      result,
     });
   }
 
@@ -310,5 +444,54 @@ export class SessionService {
   public listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]> {
     assertOwner(owner);
     return this.store.listTurns(owner, sessionId);
+  }
+
+  private async loadPinnedStory(
+    questVersionId: string,
+    requireAvailable: boolean,
+  ): Promise<{ compiledStoryJson: string; storyHash: string }> {
+    const versionDetails = await this.store.getQuestVersion(questVersionId);
+
+    if (versionDetails === null) {
+      throw new SessionError("NOT_FOUND", "Quest version was not found.");
+    }
+
+    if (versionDetails.questVersion.id !== questVersionId) {
+      throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+    }
+
+    if (requireAvailable && !versionDetails.questAvailable) {
+      throw new SessionError("INVALID_TRANSITION", "Quest is not available.");
+    }
+
+    const pinnedStoryHash = versionDetails.questVersion.storyHash;
+    if (!/^[a-f\d]{64}$/i.test(pinnedStoryHash)) {
+      throw new SessionError("STORY_MISMATCH", "Quest version has an invalid content hash.");
+    }
+
+    let compiledStoryJson: string;
+    try {
+      compiledStoryJson = await this.storySource.load({ ...versionDetails.questVersion });
+    } catch (error) {
+      if (error instanceof StorySourceError) {
+        throw new SessionError(error.code, "Quest story could not be loaded.", { cause: error });
+      }
+
+      throw new SessionError("STORAGE_FAILURE", "Quest story could not be loaded.", {
+        cause: error,
+      });
+    }
+
+    if (typeof compiledStoryJson !== "string") {
+      throw new SessionError("STORY_MISMATCH", "Quest story source returned invalid content.");
+    }
+
+    compiledStoryJson = compiledStoryJson.replace(/^\uFEFF/, "");
+    const actualStoryHash = createHash("sha256").update(compiledStoryJson).digest("hex");
+    if (actualStoryHash !== pinnedStoryHash.toLowerCase()) {
+      throw new SessionError("STORY_MISMATCH", "Quest story does not match its stored version.");
+    }
+
+    return { compiledStoryJson, storyHash: pinnedStoryHash };
   }
 }

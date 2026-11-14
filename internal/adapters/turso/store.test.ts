@@ -7,7 +7,11 @@ import { pathToFileURL } from "node:url";
 import { createClient, type Transaction } from "@libsql/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionOwner } from "../../domain/model.js";
-import { SessionError, type SessionErrorCode } from "../../app/session-store.js";
+import {
+  SessionError,
+  type SessionErrorCode,
+  type SessionStore,
+} from "../../app/session-store.js";
 import { SessionService } from "../../app/sessions.js";
 import type { StoryRuntime, StoryStep } from "../../app/story.js";
 import { StorySourceError, type StorySource } from "../../app/story-source.js";
@@ -54,6 +58,7 @@ class LocalFileDatabase implements TursoDatabase {
   private client: ReturnType<typeof createClient>;
   private readonly url: string;
   private closed = false;
+  private writeQueue: Promise<void> = Promise.resolve();
 
   public constructor(url: string) {
     this.url = url;
@@ -90,6 +95,21 @@ class LocalFileDatabase implements TursoDatabase {
   }
 
   public async write<T>(operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
+    const previousWrite = this.writeQueue;
+    let releaseWrite!: () => void;
+    this.writeQueue = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    await previousWrite;
+
+    try {
+      return await this.writeTransaction(operation);
+    } finally {
+      releaseWrite();
+    }
+  }
+
+  private async writeTransaction<T>(operation: (executor: SqlExecutor) => Promise<T>): Promise<T> {
     await this.enableAndVerifyForeignKeys();
 
     let transaction: Transaction;
@@ -196,12 +216,13 @@ function makeService(
     runtime?: StoryRuntime;
     source?: StorySource;
     ids?: string[];
+    store?: SessionStore;
   } = {},
 ): SessionService {
   let nextId = 0;
   const ids = options.ids ?? [];
   return new SessionService({
-    store: createTursoSessionStore(database),
+    store: options.store ?? createTursoSessionStore(database),
     storyRuntime: options.runtime ?? new InkStoryRuntime(),
     storySource: options.source ?? source,
     newId: () => ids[nextId++] ?? `session-test-${nextId}`,
@@ -415,6 +436,210 @@ describe("Turso session store with local libSQL", () => {
       turns: [],
     });
     expect(await service.listTurns(userOwner, created.id)).toEqual([]);
+    database.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("applies both Ink branches and restores terminal output after reopening the client", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const service = makeService(database, {
+      ids: [
+        "left-branch-session",
+        "left-branch-turn-1",
+        "right-branch-session",
+        "right-branch-turn-1",
+        "left-branch-turn-2",
+        "right-branch-turn-2",
+      ],
+    });
+
+    const leftCreated = await service.createSession(userOwner, "quest-version-1", 601);
+    const leftStarted = await service.startSession(userOwner, leftCreated.id, 0);
+    const rightCreated = await service.createSession(
+      { type: "user", id: "42" },
+      "quest-version-1",
+      602,
+    );
+    const rightStarted = await service.startSession(
+      { type: "user", id: "42" },
+      rightCreated.id,
+      0,
+    );
+
+    const leftContinued = await service.applyDecision(
+      userOwner,
+      leftCreated.id,
+      leftStarted.turns[0]!.id,
+      0,
+      leftStarted.stateVersion,
+      603,
+    );
+    const rightContinued = await service.applyDecision(
+      { type: "user", id: "42" },
+      rightCreated.id,
+      rightStarted.turns[0]!.id,
+      1,
+      rightStarted.stateVersion,
+      604,
+    );
+
+    expect(leftContinued.turns[0]).toMatchObject({
+      stepNumber: 2,
+      sceneText: expect.stringContaining("left path"),
+    });
+    expect(rightContinued.turns[0]).toMatchObject({
+      stepNumber: 2,
+      sceneText: expect.stringContaining("right path"),
+    });
+
+    const leftCompleted = await service.applyDecision(
+      userOwner,
+      leftCreated.id,
+      leftContinued.turns[0]!.id,
+      0,
+      leftContinued.stateVersion,
+      605,
+    );
+    const rightCompleted = await service.applyDecision(
+      { type: "user", id: "42" },
+      rightCreated.id,
+      rightContinued.turns[0]!.id,
+      0,
+      rightContinued.stateVersion,
+      606,
+    );
+
+    expect(leftCompleted).toMatchObject({
+      status: "completed",
+      outcome: "story_completed",
+      finalScene: { text: "The left road leads home.\n", tags: ["ending:left"] },
+    });
+    expect(rightCompleted).toMatchObject({
+      status: "completed",
+      outcome: "story_completed",
+      finalScene: { text: "The right road reaches the river.\n", tags: ["ending:right"] },
+    });
+    database.close();
+
+    const recoveredDatabase = new LocalFileDatabase(temporary.url);
+    openDatabases.add(recoveredDatabase);
+    const recoveredApp = await initializeLocalApp(recoveredDatabase, source);
+    const recoveredService = requireSessions(recoveredApp);
+
+    expect(await recoveredService.getSession(userOwner, leftCreated.id)).toMatchObject({
+      status: "completed",
+      stateVersion: 3,
+      finalScene: { text: "The left road leads home.\n", tags: ["ending:left"] },
+      turns: [],
+    });
+    expect(await recoveredService.listTurns(userOwner, leftCreated.id)).toMatchObject([
+      { stepNumber: 1, decision: { choiceIndex: 0 } },
+      { stepNumber: 2, decision: { choiceIndex: 0 } },
+    ]);
+    expect(await recoveredService.getSession({ type: "user", id: "42" }, rightCreated.id))
+      .toMatchObject({
+        status: "completed",
+        finalScene: { text: "The right road reaches the river.\n", tags: ["ending:right"] },
+      });
+    recoveredDatabase.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("allows only one concurrent choice and detects a retried operation before Ink runs again", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const runtime = new InkStoryRuntime();
+    const choose = vi.spyOn(runtime, "choose");
+    const store = createTursoSessionStore(database);
+    let readyCount = 0;
+    let releaseBothReady!: () => void;
+    const bothReady = new Promise<void>((resolve) => {
+      releaseBothReady = resolve;
+    });
+    const readProcessedOperation = store.hasProcessedOperation.bind(store);
+    store.hasProcessedOperation = async (operationId: number): Promise<boolean> => {
+      const processed = await readProcessedOperation(operationId);
+      readyCount += 1;
+      if (readyCount === 2) {
+        releaseBothReady();
+      }
+      await bothReady;
+      return processed;
+    };
+    const service = makeService(database, {
+      runtime,
+      store,
+      ids: ["concurrent-session", "concurrent-turn", "concurrent-next-turn"],
+    });
+    const created = await service.createSession(userOwner, "quest-version-1", 701);
+    const started = await service.startSession(userOwner, created.id, 0);
+    const turnId = started.turns[0]!.id;
+
+    const results = await Promise.allSettled([
+      service.applyDecision(userOwner, created.id, turnId, 0, started.stateVersion, 702),
+      service.applyDecision(userOwner, created.id, turnId, 1, started.stateVersion, 703),
+    ]);
+    const fulfilledIndex = results.findIndex((result) => result.status === "fulfilled");
+    const rejected = results.find((result) => result.status === "rejected");
+    expect(fulfilledIndex).not.toBe(-1);
+    expect(rejected?.status).toBe("rejected");
+    if (rejected?.status === "rejected") {
+      expect(rejected.reason).toMatchObject({ name: "SessionError", code: "CONFLICT" });
+    }
+
+    const winningOperationId = fulfilledIndex === 0 ? 702 : 703;
+    const afterRace = await service.getSession(userOwner, created.id);
+    expect(afterRace).toMatchObject({ status: "active", stateVersion: 2 });
+    expect(await processedUpdateCount(database, 702) + await processedUpdateCount(database, 703))
+      .toBe(1);
+    const callsBeforeRetry = choose.mock.calls.length;
+
+    await expectSessionError(
+      service.applyDecision(userOwner, created.id, turnId, 0, started.stateVersion, winningOperationId),
+      "DUPLICATE_OPERATION",
+    );
+
+    expect(choose).toHaveBeenCalledTimes(callsBeforeRetry);
+    expect((await service.listTurns(userOwner, created.id))).toHaveLength(2);
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("rolls back the processed operation and session update when inserting the next turn fails", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const service = makeService(database, {
+      ids: ["rollback-session", "rollback-turn", "rollback-turn"],
+    });
+    const created = await service.createSession(userOwner, "quest-version-1", 801);
+    const started = await service.startSession(userOwner, created.id, 0);
+
+    await expectSessionError(
+      service.applyDecision(
+        userOwner,
+        created.id,
+        started.turns[0]!.id,
+        0,
+        started.stateVersion,
+        802,
+      ),
+      "STORAGE_FAILURE",
+    );
+
+    expect(await processedUpdateCount(database, 802)).toBe(0);
+    expect(await service.getSession(userOwner, created.id)).toMatchObject({
+      status: "active",
+      stateVersion: 1,
+      inkState: started.inkState,
+      turns: [{ id: started.turns[0]!.id, decision: null }],
+    });
+    expect(await service.listTurns(userOwner, created.id)).toHaveLength(1);
     database.close();
   }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
 
