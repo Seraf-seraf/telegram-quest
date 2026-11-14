@@ -54,6 +54,52 @@ describe("createTelegramWebhookHandler", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("does not initialize storage until POST and secret checks pass", async () => {
+    const fetchMock = createTelegramApiFetchMock();
+    const ensureReady = vi.fn(async () => undefined);
+    const bot = new Bot(botToken, { client: { fetch: fetchMock } });
+    const handleWebhook = createTelegramWebhookHandler(
+      bot,
+      secretToken,
+      ensureReady,
+    );
+
+    const methodResponse = await handleWebhook(
+      new Request("https://telegram-quest.example/api/webhook", {
+        method: "GET",
+      }),
+    );
+    const secretResponse = await handleWebhook(
+      createRequest("wrong-secret", JSON.stringify({ update_id: 1 })),
+    );
+
+    expect(methodResponse.status).toBe(405);
+    expect(secretResponse.status).toBe(401);
+    expect(ensureReady).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns a detail-free 503 if storage is not ready", async () => {
+    const fetchMock = createTelegramApiFetchMock();
+    const ensureReady = vi.fn(async () => {
+      throw new Error("private database URL and token");
+    });
+    const bot = new Bot(botToken, { client: { fetch: fetchMock } });
+    const handleWebhook = createTelegramWebhookHandler(
+      bot,
+      secretToken,
+      ensureReady,
+    );
+    const response = await handleWebhook(
+      createRequest(secretToken, JSON.stringify({ update_id: 1 })),
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe("");
+    expect(ensureReady).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("passes a valid update to grammY without calling the real Telegram API", async () => {
     const fetchMock = createTelegramApiFetchMock();
 
@@ -76,11 +122,18 @@ describe("createTelegramWebhookHandler", () => {
       },
     });
     let receivedText: string | undefined;
+    const calls: string[] = [];
     bot.on("message:text", (context) => {
       receivedText = context.message.text;
     });
 
-    const handleWebhook = createTelegramWebhookHandler(bot, secretToken);
+    const handleWebhook = createTelegramWebhookHandler(
+      bot,
+      secretToken,
+      async () => {
+        calls.push("ready");
+      },
+    );
     const response = await handleWebhook(
       createRequest(
         secretToken,
@@ -98,6 +151,7 @@ describe("createTelegramWebhookHandler", () => {
     );
 
     expect(response.status).toBe(200);
+    expect(calls).toEqual(["ready"]);
     expect(receivedText).toBe("hello");
     expect(fetchMock).not.toHaveBeenCalled();
   });

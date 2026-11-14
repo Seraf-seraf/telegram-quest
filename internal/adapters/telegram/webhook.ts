@@ -20,6 +20,7 @@ function hasValidSecretToken(request: Request, expectedToken: string): boolean {
 export function createTelegramWebhookHandler(
   bot: Bot,
   secretToken: string,
+  ensureReady?: () => Promise<void>,
 ): (request: Request) => Promise<Response> {
   const handleUpdate = webhookCallback(bot, "std/http", { secretToken });
 
@@ -35,6 +36,14 @@ export function createTelegramWebhookHandler(
     // an invalid request cannot trigger its initial getMe API call.
     if (!hasValidSecretToken(request, secretToken)) {
       return new Response(null, { status: 401 });
+    }
+
+    if (ensureReady !== undefined) {
+      try {
+        await ensureReady();
+      } catch {
+        return new Response(null, { status: 503 });
+      }
     }
 
     return handleUpdate(request);
