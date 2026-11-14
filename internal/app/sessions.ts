@@ -8,6 +8,12 @@ import type {
 import {
   SessionError,
   type ApplyDecisionRecord,
+  type InitialTurnRecord,
+  type PauseSessionRecord,
+  type ResumeSessionRecord,
+  type RewindSessionRecord,
+  type SessionTransitionRecord,
+  type StartSessionRecord,
   type SessionStore,
 } from "./session-store.js";
 import { StoryRuntimeError, type StoryRuntime, type StoryStep } from "./story.js";
@@ -209,46 +215,7 @@ export class SessionService {
       });
     }
 
-    let voteDurationMs: number | null = null;
-    let defaultChoiceIndex: number | null = null;
-
-    if (owner.type === "group") {
-      if (groupPolicy === undefined) {
-        throw new SessionError(
-          "INVALID_TRANSITION",
-          "A group turn requires a trusted vote policy.",
-        );
-      }
-
-      if (!Number.isSafeInteger(groupPolicy.voteDurationMs) || groupPolicy.voteDurationMs <= 0) {
-        throw new SessionError("INVALID_TRANSITION", "Group vote duration is invalid.");
-      }
-
-      if (
-        !Number.isSafeInteger(groupPolicy.defaultChoiceIndex) ||
-        groupPolicy.defaultChoiceIndex < 0 ||
-        groupPolicy.defaultChoiceIndex >= step.choices.length ||
-        !step.choices.some((choice) => choice.index === groupPolicy.defaultChoiceIndex)
-      ) {
-        throw new SessionError("INVALID_CHOICE", "Group default choice is not available.");
-      }
-
-      voteDurationMs = groupPolicy.voteDurationMs;
-      defaultChoiceIndex = groupPolicy.defaultChoiceIndex;
-    }
-
-    const initialTurn = {
-      turn: {
-        id: createId(this.newId, "Turn ID"),
-        stepNumber: 1,
-        inkCheckpoint: step.stateJson,
-        sceneText: step.text,
-        choices: step.choices.map(cloneChoice),
-        decision: null,
-      },
-      voteDurationMs,
-      defaultChoiceIndex,
-    };
+    const initialTurn = this.createInitialTurn(owner, step, groupPolicy);
 
     return this.store.startSession({
       kind: "active",
@@ -436,6 +403,134 @@ export class SessionService {
     });
   }
 
+  public async pauseSession(
+    owner: SessionOwner,
+    sessionId: string,
+    expectedStateVersion: number,
+  ): Promise<Session> {
+    const session = await this.getExpectedSession(owner, sessionId, expectedStateVersion);
+    if (session.status !== "active") {
+      throw new SessionError("INVALID_TRANSITION", "Only an active session can be paused.");
+    }
+
+    const nowMs = this.now();
+    assertNonNegativeSafeInteger(nowMs, "Current time");
+    const input: PauseSessionRecord = { sessionId, owner, expectedStateVersion, nowMs };
+    return this.store.pauseSession(input);
+  }
+
+  public async resumeSession(
+    owner: SessionOwner,
+    sessionId: string,
+    expectedStateVersion: number,
+  ): Promise<Session> {
+    const session = await this.getExpectedSession(owner, sessionId, expectedStateVersion);
+    if (session.status !== "paused") {
+      throw new SessionError("INVALID_TRANSITION", "Only a paused session can be resumed.");
+    }
+
+    const nowMs = this.now();
+    assertNonNegativeSafeInteger(nowMs, "Current time");
+    const input: ResumeSessionRecord = { sessionId, owner, expectedStateVersion, nowMs };
+    return this.store.resumeSession(input);
+  }
+
+  public async stopSession(
+    owner: SessionOwner,
+    sessionId: string,
+    expectedStateVersion: number,
+  ): Promise<Session> {
+    const session = await this.getExpectedSession(owner, sessionId, expectedStateVersion);
+    if (session.status === "completed") {
+      throw new SessionError("INVALID_TRANSITION", "Completed session cannot be stopped.");
+    }
+
+    const input: SessionTransitionRecord = { sessionId, owner, expectedStateVersion };
+    return this.store.stopSession(input);
+  }
+
+  public async restartSession(
+    owner: SessionOwner,
+    sessionId: string,
+    expectedStateVersion: number,
+    confirmed: boolean,
+    groupPolicy?: GroupTurnPolicy,
+  ): Promise<Session> {
+    const session = await this.getExpectedSession(owner, sessionId, expectedStateVersion);
+    if (confirmed !== true) {
+      throw new SessionError("INVALID_TRANSITION", "Restart requires explicit confirmation.");
+    }
+
+    const pinnedStory = await this.loadPinnedStory(session.questVersionId, true);
+    let step: StoryStep;
+    try {
+      step = this.storyRuntime.start(pinnedStory.compiledStoryJson);
+    } catch (error) {
+      const message = error instanceof StoryRuntimeError && error.code === "INVALID_STORY"
+        ? "Quest story is not a valid compiled Ink story."
+        : "Quest story could not be started.";
+      throw new SessionError("STORY_MISMATCH", message, { cause: error });
+    }
+
+    assertStoryStep(step);
+    if (!step.ended && step.choices.length === 0) {
+      throw new SessionError("STORY_MISMATCH", "Story has no choice at its first decision point.");
+    }
+
+    let input: StartSessionRecord;
+    if (step.ended) {
+      input = {
+        kind: "completed",
+        sessionId,
+        owner,
+        questVersionId: session.questVersionId,
+        storyHash: pinnedStory.storyHash,
+        expectedStateVersion,
+        inkState: step.stateJson,
+        finalScene: { text: step.text, tags: [...step.tags] },
+      };
+    } else {
+      input = {
+        kind: "active",
+        sessionId,
+        owner,
+        questVersionId: session.questVersionId,
+        storyHash: pinnedStory.storyHash,
+        expectedStateVersion,
+        inkState: step.stateJson,
+        initialTurn: this.createInitialTurn(owner, step, groupPolicy),
+      };
+    }
+
+    return this.store.restartSession(input);
+  }
+
+  public async rewindSession(
+    owner: SessionOwner,
+    sessionId: string,
+    targetStepNo: number,
+    expectedStateVersion: number,
+  ): Promise<Session> {
+    assertNonNegativeSafeInteger(expectedStateVersion, "Expected state version");
+    if (!Number.isSafeInteger(targetStepNo) || targetStepNo < 1) {
+      throw new SessionError("INVALID_TRANSITION", "Target turn number is invalid.");
+    }
+
+    const session = await this.getExpectedSession(owner, sessionId, expectedStateVersion);
+    if (session.status !== "active" && session.status !== "paused") {
+      throw new SessionError("INVALID_TRANSITION", "Only active or paused sessions can be rewound.");
+    }
+
+    const input: RewindSessionRecord = {
+      sessionId,
+      owner,
+      expectedStateVersion,
+      targetStepNo,
+      newTurnId: createId(this.newId, "Turn ID"),
+    };
+    return this.store.rewindSession(input);
+  }
+
   public getSession(owner: SessionOwner, sessionId: string): Promise<Session> {
     assertOwner(owner);
     return this.store.getSession(owner, sessionId);
@@ -444,6 +539,71 @@ export class SessionService {
   public listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]> {
     assertOwner(owner);
     return this.store.listTurns(owner, sessionId);
+  }
+
+  private async getExpectedSession(
+    owner: SessionOwner,
+    sessionId: string,
+    expectedStateVersion: number,
+  ): Promise<Session> {
+    assertOwner(owner);
+    assertNonNegativeSafeInteger(expectedStateVersion, "Expected state version");
+    if (
+      typeof sessionId !== "string" ||
+      sessionId.length === 0 ||
+      sessionId.trim() !== sessionId
+    ) {
+      throw new SessionError("INVALID_TRANSITION", "Session ID is invalid.");
+    }
+
+    const session = await this.store.getSession(owner, sessionId);
+    if (session.stateVersion !== expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    return session;
+  }
+
+  private createInitialTurn(
+    owner: SessionOwner,
+    step: StoryStep,
+    groupPolicy?: GroupTurnPolicy,
+  ): InitialTurnRecord {
+    let voteDurationMs: number | null = null;
+    let defaultChoiceIndex: number | null = null;
+    if (owner.type === "group") {
+      if (groupPolicy === undefined) {
+        throw new SessionError(
+          "INVALID_TRANSITION",
+          "A group turn requires a trusted vote policy.",
+        );
+      }
+      if (!Number.isSafeInteger(groupPolicy.voteDurationMs) || groupPolicy.voteDurationMs <= 0) {
+        throw new SessionError("INVALID_TRANSITION", "Group vote duration is invalid.");
+      }
+      if (
+        !Number.isSafeInteger(groupPolicy.defaultChoiceIndex) ||
+        groupPolicy.defaultChoiceIndex < 0 ||
+        groupPolicy.defaultChoiceIndex >= step.choices.length ||
+        !step.choices.some((choice) => choice.index === groupPolicy.defaultChoiceIndex)
+      ) {
+        throw new SessionError("INVALID_CHOICE", "Group default choice is not available.");
+      }
+      voteDurationMs = groupPolicy.voteDurationMs;
+      defaultChoiceIndex = groupPolicy.defaultChoiceIndex;
+    }
+
+    return {
+      turn: {
+        id: createId(this.newId, "Turn ID"),
+        stepNumber: 1,
+        inkCheckpoint: step.stateJson,
+        sceneText: step.text,
+        choices: step.choices.map(cloneChoice),
+        decision: null,
+      },
+      voteDurationMs,
+      defaultChoiceIndex,
+    };
   }
 
   private async loadPinnedStory(

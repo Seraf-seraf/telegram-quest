@@ -12,8 +12,12 @@ import {
   SessionError,
   type ApplyDecisionRecord,
   type CreateSessionRecord,
+  type PauseSessionRecord,
+  type RewindSessionRecord,
+  type ResumeSessionRecord,
   type SessionQuestVersion,
   type SessionStore,
+  type SessionTransitionRecord,
   type StartSessionRecord,
 } from "../../app/session-store.js";
 import type { SqlExecutor, SqlRow, TursoDatabase } from "./client.js";
@@ -323,6 +327,7 @@ async function readSession(
        FROM session
        LEFT JOIN turn
          ON turn.session_id = session.id AND turn.decision_choice_index IS NULL
+        AND session.status IN ('active', 'paused')
       WHERE session.id = ?
       ORDER BY turn.step_no DESC
       LIMIT 2`,
@@ -511,6 +516,43 @@ function validateDecision(input: ApplyDecisionRecord): void {
   ) {
     throw new SessionError("INVALID_TRANSITION", "Final story output is invalid.");
   }
+}
+
+interface TurnTimerState {
+  voteDurationMs: number | null;
+  deadlineAtMs: number | null;
+  remainingMs: number | null;
+}
+
+async function readTurnTimerState(
+  executor: SqlExecutor,
+  sessionId: string,
+  turnId: string,
+): Promise<TurnTimerState> {
+  const row = await executor.get(
+    `SELECT vote_duration_ms, deadline_at_ms, remaining_ms
+       FROM turn
+      WHERE id = ? AND session_id = ? AND decision_choice_index IS NULL`,
+    turnId,
+    sessionId,
+  );
+  if (row === undefined) {
+    throw new SessionError("INVALID_TRANSITION", "Current turn is no longer open.");
+  }
+
+  const timer = {
+    voteDurationMs: readNullableInteger(row, "vote_duration_ms"),
+    deadlineAtMs: readNullableInteger(row, "deadline_at_ms"),
+    remainingMs: readNullableInteger(row, "remaining_ms"),
+  };
+  if (
+    (timer.deadlineAtMs !== null && timer.remainingMs !== null) ||
+    ((timer.deadlineAtMs !== null || timer.remainingMs !== null) &&
+      timer.voteDurationMs === null)
+  ) {
+    throw invalidStorageData("turn timer");
+  }
+  return timer;
 }
 
 export function createTursoSessionStore(database: TursoDatabase): SessionStore {
@@ -822,6 +864,375 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
             input.result.nextTurn.voteDurationMs,
           );
         }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async pauseSession(input: PauseSessionRecord): Promise<Session> {
+      if (!Number.isSafeInteger(input.nowMs) || input.nowMs < 0) {
+        throw new SessionError("INVALID_TRANSITION", "Current time is invalid.");
+      }
+
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+        if (readStatus(sessionRow) !== "active") {
+          throw new SessionError("INVALID_TRANSITION", "Only an active session can be paused.");
+        }
+
+        const session = await readSession(executor, input.owner, input.sessionId);
+        const currentTurn = session.turns[0];
+        if (currentTurn === undefined) {
+          throw invalidStorageData("active session turn");
+        }
+        const timer = await readTurnTimerState(executor, input.sessionId, currentTurn.id);
+        if (timer.remainingMs !== null) {
+          throw invalidStorageData("active turn timer");
+        }
+
+        const remainingMs = timer.deadlineAtMs === null
+          ? null
+          : Math.max(timer.deadlineAtMs - input.nowMs, 0);
+        if (remainingMs !== null && !Number.isSafeInteger(remainingMs)) {
+          throw new SessionError("INVALID_TRANSITION", "Remaining vote duration is invalid.");
+        }
+
+        const updatedTurn = await executor.get(
+          `UPDATE turn
+              SET deadline_at_ms = NULL, remaining_ms = ?
+            WHERE id = ? AND session_id = ? AND decision_choice_index IS NULL
+          RETURNING id`,
+          remainingMs,
+          currentTurn.id,
+          input.sessionId,
+        );
+        if (updatedTurn === undefined) {
+          throw new SessionError("INVALID_TRANSITION", "Current turn is no longer open.");
+        }
+
+        const updatedSession = await executor.get(
+          `UPDATE session
+              SET status = 'paused', state_version = state_version + 1
+            WHERE id = ? AND owner_type = ? AND owner_id = ?
+              AND status = 'active' AND state_version = ?
+          RETURNING id`,
+          input.sessionId,
+          input.owner.type,
+          input.owner.id,
+          input.expectedStateVersion,
+        );
+        if (updatedSession === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async resumeSession(input: ResumeSessionRecord): Promise<Session> {
+      if (!Number.isSafeInteger(input.nowMs) || input.nowMs < 0) {
+        throw new SessionError("INVALID_TRANSITION", "Current time is invalid.");
+      }
+
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+        if (readStatus(sessionRow) !== "paused") {
+          throw new SessionError("INVALID_TRANSITION", "Only a paused session can be resumed.");
+        }
+
+        const session = await readSession(executor, input.owner, input.sessionId);
+        const currentTurn = session.turns[0];
+        if (currentTurn === undefined) {
+          throw invalidStorageData("paused session turn");
+        }
+        const timer = await readTurnTimerState(executor, input.sessionId, currentTurn.id);
+        if (timer.deadlineAtMs !== null) {
+          throw invalidStorageData("paused turn timer");
+        }
+
+        const deadlineAtMs = timer.remainingMs === null
+          ? null
+          : input.nowMs + timer.remainingMs;
+        if (deadlineAtMs !== null && !Number.isSafeInteger(deadlineAtMs)) {
+          throw new SessionError("INVALID_TRANSITION", "Resumed vote deadline is invalid.");
+        }
+
+        const updatedTurn = await executor.get(
+          `UPDATE turn
+              SET deadline_at_ms = ?, remaining_ms = NULL
+            WHERE id = ? AND session_id = ? AND decision_choice_index IS NULL
+          RETURNING id`,
+          deadlineAtMs,
+          currentTurn.id,
+          input.sessionId,
+        );
+        if (updatedTurn === undefined) {
+          throw new SessionError("INVALID_TRANSITION", "Current turn is no longer open.");
+        }
+
+        const updatedSession = await executor.get(
+          `UPDATE session
+              SET status = 'active', state_version = state_version + 1
+            WHERE id = ? AND owner_type = ? AND owner_id = ?
+              AND status = 'paused' AND state_version = ?
+          RETURNING id`,
+          input.sessionId,
+          input.owner.type,
+          input.owner.id,
+          input.expectedStateVersion,
+        );
+        if (updatedSession === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async stopSession(input: SessionTransitionRecord): Promise<Session> {
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+        const status = readStatus(sessionRow);
+        if (status !== "created" && status !== "active" && status !== "paused") {
+          throw new SessionError("INVALID_TRANSITION", "Session cannot be stopped.");
+        }
+
+        if (status === "active" || status === "paused") {
+          const session = await readSession(executor, input.owner, input.sessionId);
+          const currentTurn = session.turns[0];
+          if (currentTurn === undefined) {
+            throw invalidStorageData("open session turn");
+          }
+          const updatedTurn = await executor.get(
+            `UPDATE turn
+                SET deadline_at_ms = NULL, remaining_ms = NULL
+              WHERE id = ? AND session_id = ? AND decision_choice_index IS NULL
+            RETURNING id`,
+            currentTurn.id,
+            input.sessionId,
+          );
+          if (updatedTurn === undefined) {
+            throw new SessionError("INVALID_TRANSITION", "Current turn is no longer open.");
+          }
+        }
+
+        const updatedSession = await executor.get(
+          `UPDATE session
+              SET status = 'completed',
+                  state_version = state_version + 1,
+                  outcome = 'stopped_by_owner',
+                  final_scene_text = NULL,
+                  final_scene_tags_json = NULL
+            WHERE id = ? AND owner_type = ? AND owner_id = ?
+              AND status = ? AND state_version = ?
+          RETURNING id`,
+          input.sessionId,
+          input.owner.type,
+          input.owner.id,
+          status,
+          input.expectedStateVersion,
+        );
+        if (updatedSession === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async restartSession(input: StartSessionRecord): Promise<Session> {
+      if (input.kind === "active") {
+        validateActiveStart(input);
+      } else {
+        validateCompletedStart(input);
+      }
+
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+        if (readString(sessionRow, "quest_version_id") !== input.questVersionId) {
+          throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+        }
+
+        const latestVersion = assertVersionAvailable(
+          await readQuestVersion(executor, input.questVersionId),
+        );
+        if (
+          latestVersion.questVersion.id !== input.questVersionId ||
+          latestVersion.questVersion.storyHash.toLowerCase() !== input.storyHash.toLowerCase()
+        ) {
+          throw new SessionError("STORY_MISMATCH", "Quest version changed while it was loading.");
+        }
+
+        if (input.kind === "active") {
+          const oldTurn = await executor.get(
+            "SELECT id FROM turn WHERE session_id = ? AND id = ?",
+            input.sessionId,
+            input.initialTurn.turn.id,
+          );
+          if (oldTurn !== undefined) {
+            throw new SessionError("INVALID_TRANSITION", "Restart must use a fresh turn ID.");
+          }
+        }
+
+        await executor.run("DELETE FROM turn WHERE session_id = ?", input.sessionId);
+        const completed = input.kind === "completed";
+        const finalScene = completed ? input.finalScene : null;
+        let updated: SqlRow | undefined;
+        try {
+          updated = await executor.get(
+            `UPDATE session
+                SET status = ?,
+                    ink_state_json = ?,
+                    state_version = state_version + 1,
+                    outcome = ?,
+                    final_scene_text = ?,
+                    final_scene_tags_json = ?
+              WHERE id = ? AND owner_type = ? AND owner_id = ?
+                AND quest_version_id = ? AND state_version = ?
+            RETURNING id`,
+            completed ? "completed" : "active",
+            input.inkState,
+            completed ? "story_completed" : null,
+            finalScene?.text ?? null,
+            finalScene === null ? null : JSON.stringify(finalScene.tags),
+            input.sessionId,
+            input.owner.type,
+            input.owner.id,
+            input.questVersionId,
+            input.expectedStateVersion,
+          );
+        } catch (error) {
+          if (isConstraintViolation(error)) {
+            throw new SessionError("CONFLICT", "Session could not be restarted for this owner.");
+          }
+          throw error;
+        }
+        if (updated === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        if (input.kind === "active") {
+          const turn = input.initialTurn.turn;
+          await executor.run(
+            `INSERT INTO turn (
+               id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+               default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
+               interactive_message_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+            turn.id,
+            input.sessionId,
+            turn.stepNumber,
+            turn.inkCheckpoint,
+            turn.sceneText,
+            JSON.stringify(turn.choices),
+            input.initialTurn.defaultChoiceIndex,
+            input.initialTurn.voteDurationMs,
+          );
+        }
+
+        return readSession(executor, input.owner, input.sessionId);
+      });
+    },
+
+    async rewindSession(input: RewindSessionRecord): Promise<Session> {
+      if (
+        !Number.isSafeInteger(input.expectedStateVersion) ||
+        input.expectedStateVersion < 0 ||
+        !Number.isSafeInteger(input.targetStepNo) ||
+        input.targetStepNo < 1 ||
+        input.newTurnId.length === 0
+      ) {
+        throw new SessionError("INVALID_TRANSITION", "Rewind record is invalid.");
+      }
+
+      return inWrite(async (executor) => {
+        const sessionRow = await requireOwnedSession(executor, input.owner, input.sessionId);
+        if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+        const status = readStatus(sessionRow);
+        if (status !== "active" && status !== "paused") {
+          throw new SessionError("INVALID_TRANSITION", "Only active or paused sessions can be rewound.");
+        }
+
+        const session = await readSession(executor, input.owner, input.sessionId);
+        const targetRow = await executor.get(
+          `SELECT id, step_no, ink_checkpoint_json, scene_text, choices_json,
+                  decision_choice_index, default_choice_index, vote_duration_ms
+             FROM turn
+            WHERE session_id = ? AND step_no = ?`,
+          input.sessionId,
+          input.targetStepNo,
+        );
+        if (targetRow === undefined) {
+          throw new SessionError("NOT_FOUND", "Turn was not found.");
+        }
+        const existingId = await executor.get(
+          "SELECT id FROM turn WHERE id = ?",
+          input.newTurnId,
+        );
+        if (existingId !== undefined) {
+          throw new SessionError("INVALID_TRANSITION", "Rewind must use a fresh turn ID.");
+        }
+
+        const targetTurn = mapTurn(targetRow);
+        const defaultChoiceIndex = readNullableInteger(targetRow, "default_choice_index");
+        const voteDurationMs = readNullableInteger(targetRow, "vote_duration_ms");
+        const replacement: Turn = {
+          ...targetTurn,
+          id: input.newTurnId,
+          decision: null,
+        };
+        await executor.run(
+          "DELETE FROM turn WHERE session_id = ? AND step_no >= ?",
+          input.sessionId,
+          input.targetStepNo,
+        );
+
+        const updatedSession = await executor.get(
+          `UPDATE session
+              SET ink_state_json = ?, state_version = state_version + 1
+            WHERE id = ? AND owner_type = ? AND owner_id = ?
+              AND status = ? AND state_version = ?
+          RETURNING id`,
+          targetTurn.inkCheckpoint,
+          input.sessionId,
+          input.owner.type,
+          input.owner.id,
+          status,
+          input.expectedStateVersion,
+        );
+        if (updatedSession === undefined) {
+          throw new SessionError("CONFLICT", "Session state changed.");
+        }
+
+        await executor.run(
+          `INSERT INTO turn (
+             id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+             default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
+             interactive_message_id, decision_choice_index
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+          replacement.id,
+          input.sessionId,
+          replacement.stepNumber,
+          replacement.inkCheckpoint,
+          replacement.sceneText,
+          JSON.stringify(replacement.choices),
+          defaultChoiceIndex,
+          voteDurationMs,
+        );
 
         return readSession(executor, input.owner, input.sessionId);
       });

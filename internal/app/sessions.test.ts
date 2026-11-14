@@ -14,6 +14,10 @@ import {
   type SessionStore,
   type SessionErrorCode,
   type ApplyDecisionRecord,
+  type PauseSessionRecord,
+  type ResumeSessionRecord,
+  type RewindSessionRecord,
+  type SessionTransitionRecord,
   type StartSessionRecord,
 } from "./session-store.js";
 import { SessionService } from "./sessions.js";
@@ -93,6 +97,11 @@ function makeStore(options: {
   createSession: ReturnType<typeof vi.fn>;
   hasProcessedOperation: ReturnType<typeof vi.fn>;
   applyDecision: ReturnType<typeof vi.fn>;
+  pauseSession: ReturnType<typeof vi.fn>;
+  resumeSession: ReturnType<typeof vi.fn>;
+  stopSession: ReturnType<typeof vi.fn>;
+  restartSession: ReturnType<typeof vi.fn>;
+  rewindSession: ReturnType<typeof vi.fn>;
 } {
   let currentSession = options.session ?? makeSession();
   const processedOperationIds = new Set(options.processedOperationIds ?? []);
@@ -191,6 +200,91 @@ function makeStore(options: {
     };
     return currentSession;
   });
+  const pauseSession = vi.fn(async (input: PauseSessionRecord) => {
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    if (currentSession.status !== "active") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot be paused.");
+    }
+    currentSession = {
+      ...currentSession,
+      status: "paused",
+      stateVersion: currentSession.stateVersion + 1,
+    };
+    return currentSession;
+  });
+  const resumeSession = vi.fn(async (input: ResumeSessionRecord) => {
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    if (currentSession.status !== "paused") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot be resumed.");
+    }
+    currentSession = {
+      ...currentSession,
+      status: "active",
+      stateVersion: currentSession.stateVersion + 1,
+    };
+    return currentSession;
+  });
+  const stopSession = vi.fn(async (input: SessionTransitionRecord) => {
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    if (currentSession.status === "completed") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot be stopped.");
+    }
+    currentSession = {
+      ...currentSession,
+      status: "completed",
+      stateVersion: currentSession.stateVersion + 1,
+      outcome: "stopped_by_owner",
+      finalScene: null,
+    };
+    return currentSession;
+  });
+  const restartSession = vi.fn(async (input: StartSessionRecord) => {
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    const completed = input.kind === "completed";
+    currentSession = {
+      ...currentSession,
+      status: completed ? "completed" : "active",
+      inkState: input.inkState,
+      stateVersion: currentSession.stateVersion + 1,
+      turns: completed ? [] : [input.initialTurn.turn],
+      outcome: completed ? "story_completed" : null,
+      finalScene: completed ? input.finalScene : null,
+    };
+    return currentSession;
+  });
+  const rewindSession = vi.fn(async (input: RewindSessionRecord) => {
+    if (currentSession.stateVersion !== input.expectedStateVersion) {
+      throw new SessionError("CONFLICT", "Session state changed.");
+    }
+    if (currentSession.status !== "active" && currentSession.status !== "paused") {
+      throw new SessionError("INVALID_TRANSITION", "Session cannot be rewound.");
+    }
+    const targetIndex = currentSession.turns.findIndex(
+      (turn) => turn.stepNumber === input.targetStepNo,
+    );
+    if (targetIndex < 0) {
+      throw new SessionError("NOT_FOUND", "Turn was not found.");
+    }
+    const target = currentSession.turns[targetIndex]!;
+    currentSession = {
+      ...currentSession,
+      inkState: target.inkCheckpoint,
+      stateVersion: currentSession.stateVersion + 1,
+      turns: [
+        ...currentSession.turns.slice(0, targetIndex),
+        { ...target, id: input.newTurnId, decision: null },
+      ],
+    };
+    return currentSession;
+  });
 
   return {
     createSession,
@@ -200,6 +294,11 @@ function makeStore(options: {
     startSession,
     hasProcessedOperation,
     applyDecision,
+    pauseSession,
+    resumeSession,
+    stopSession,
+    restartSession,
+    rewindSession,
   };
 }
 
@@ -772,6 +871,157 @@ describe("SessionService", () => {
       finalScene: { text: "The left road leads home.\n", tags: ["ending:left"] },
       turns: [{ id: "turn-2", decision: { choiceIndex: 0 } }],
     });
+  });
+
+  it("pauses and resumes with one injected timestamp and increments the state version", async () => {
+    const session = makeActiveSession();
+    const store = makeStore({ session });
+    const runtime = new InkStoryRuntime();
+    const choose = vi.spyOn(runtime, "choose");
+    const { service } = makeService({ store, storyRuntime: runtime });
+
+    const paused = await service.pauseSession(userOwner, session.id, session.stateVersion);
+    const resumed = await service.resumeSession(userOwner, session.id, paused.stateVersion);
+
+    expect(paused).toMatchObject({ status: "paused", stateVersion: 2, inkState: session.inkState });
+    expect(resumed).toMatchObject({ status: "active", stateVersion: 3, inkState: session.inkState });
+    expect(store.pauseSession).toHaveBeenCalledWith({
+      sessionId: session.id,
+      owner: userOwner,
+      expectedStateVersion: 1,
+      nowMs: 1_700_000_000_000,
+    });
+    expect(store.resumeSession).toHaveBeenCalledWith({
+      sessionId: session.id,
+      owner: userOwner,
+      expectedStateVersion: 2,
+      nowMs: 1_700_000_000_000,
+    });
+    expect(choose).not.toHaveBeenCalled();
+  });
+
+  it("rejects decisions while paused and stops without mislabeling a story ending", async () => {
+    const session = makeActiveSession();
+    const store = makeStore({ session });
+    const runtime = new InkStoryRuntime();
+    const choose = vi.spyOn(runtime, "choose");
+    const { service } = makeService({ store, storyRuntime: runtime });
+    const paused = await service.pauseSession(userOwner, session.id, session.stateVersion);
+
+    await expectSessionError(
+      service.applyDecision(
+        userOwner,
+        session.id,
+        session.turns[0]!.id,
+        0,
+        paused.stateVersion,
+        901,
+      ),
+      "INVALID_TRANSITION",
+    );
+    expect(choose).not.toHaveBeenCalled();
+
+    const stopped = await service.stopSession(userOwner, session.id, paused.stateVersion);
+    expect(stopped).toMatchObject({
+      status: "completed",
+      stateVersion: 3,
+      outcome: "stopped_by_owner",
+      finalScene: null,
+    });
+  });
+
+  it("requires explicit restart confirmation and restarts the pinned story with a fresh turn", async () => {
+    const session = makeActiveSession();
+    const store = makeStore({ session });
+    const runtime = new InkStoryRuntime();
+    const start = vi.spyOn(runtime, "start");
+    const source = { load: vi.fn(async () => compiledStoryJson) };
+    const unconfirmed = makeService({ store, storyRuntime: runtime, storySource: source });
+
+    await expectSessionError(
+      unconfirmed.service.restartSession(userOwner, session.id, session.stateVersion, false),
+      "INVALID_TRANSITION",
+    );
+    expect(source.load).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+
+    const confirmed = makeService({
+      store,
+      storyRuntime: runtime,
+      storySource: source,
+      ids: ["fresh-turn"],
+    });
+    const restarted = await confirmed.service.restartSession(
+      userOwner,
+      session.id,
+      session.stateVersion,
+      true,
+    );
+
+    expect(restarted).toMatchObject({
+      id: session.id,
+      status: "active",
+      stateVersion: 2,
+      turns: [{ id: "fresh-turn", stepNumber: 1, decision: null }],
+    });
+    expect(restarted.turns[0]?.id).not.toBe(session.turns[0]?.id);
+    expect(store.restartSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: session.id,
+      expectedStateVersion: session.stateVersion,
+      questVersionId: session.questVersionId,
+      storyHash,
+    }));
+  });
+
+  it("rewinds to the selected checkpoint with a fresh ID and refuses completed sessions", async () => {
+    const checkpoint1 = "{\"checkpoint\":1}";
+    const checkpoint2 = "{\"checkpoint\":2}";
+    const session = makeSession({
+      status: "active",
+      inkState: checkpoint2,
+      stateVersion: 2,
+      turns: [
+        makeTurn({
+          id: "old-turn-1",
+          stepNumber: 1,
+          inkCheckpoint: checkpoint1,
+          decision: { choiceIndex: 0 },
+        }),
+        makeTurn({
+          id: "old-turn-2",
+          stepNumber: 2,
+          inkCheckpoint: checkpoint2,
+        }),
+      ],
+    });
+    const store = makeStore({ session });
+    const { service } = makeService({ store, ids: ["replacement-turn"] });
+
+    const rewound = await service.rewindSession(userOwner, session.id, 1, session.stateVersion);
+
+    expect(rewound).toMatchObject({
+      status: "active",
+      stateVersion: 3,
+      inkState: checkpoint1,
+      turns: [{ id: "replacement-turn", stepNumber: 1, decision: null }],
+    });
+    expect(store.rewindSession).toHaveBeenCalledWith({
+      sessionId: session.id,
+      owner: userOwner,
+      expectedStateVersion: session.stateVersion,
+      targetStepNo: 1,
+      newTurnId: "replacement-turn",
+    });
+
+    const completedStore = makeStore({
+      session: makeSession({ status: "completed", stateVersion: 4, outcome: "story_completed" }),
+    });
+    const completed = makeService({ store: completedStore });
+    await expectSessionError(
+      completed.service.rewindSession(userOwner, "session-1", 1, 4),
+      "INVALID_TRANSITION",
+    );
+    expect(completedStore.rewindSession).not.toHaveBeenCalled();
   });
 
   it("keeps owner, transition and expected-state failures distinct", async () => {

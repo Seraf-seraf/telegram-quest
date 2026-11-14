@@ -217,6 +217,7 @@ function makeService(
     source?: StorySource;
     ids?: string[];
     store?: SessionStore;
+    now?: () => number;
   } = {},
 ): SessionService {
   let nextId = 0;
@@ -226,7 +227,7 @@ function makeService(
     storyRuntime: options.runtime ?? new InkStoryRuntime(),
     storySource: options.source ?? source,
     newId: () => ids[nextId++] ?? `session-test-${nextId}`,
-    now: () => 1_700_000_000_000,
+    now: options.now ?? (() => 1_700_000_000_000),
   });
 }
 
@@ -263,6 +264,38 @@ async function processedUpdateCount(database: TursoDatabase, operationId: number
       "SELECT count(*) AS count FROM processed_update WHERE update_id = ?",
       operationId,
     );
+    return Number(row?.count);
+  });
+}
+
+async function addTestVote(
+  database: TursoDatabase,
+  turnId: string,
+  voterId: string,
+): Promise<void> {
+  await database.write((executor) => executor.run(
+    `INSERT INTO vote (turn_id, voter_id, choice_index, cast_at_ms)
+     VALUES (?, ?, ?, ?)`,
+    turnId,
+    voterId,
+    0,
+    1_700_000_000_000,
+  ));
+}
+
+async function readTurnTimer(database: TursoDatabase, turnId: string): Promise<SqlRow | undefined> {
+  return database.read((executor) => executor.get(
+    `SELECT default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
+            interactive_message_id
+       FROM turn
+      WHERE id = ?`,
+    turnId,
+  ));
+}
+
+async function countVotes(database: TursoDatabase, turnId: string): Promise<number> {
+  return database.read(async (executor) => {
+    const row = await executor.get("SELECT count(*) AS count FROM vote WHERE turn_id = ?", turnId);
     return Number(row?.count);
   });
 }
@@ -640,6 +673,329 @@ describe("Turso session store with local libSQL", () => {
       turns: [{ id: started.turns[0]!.id, decision: null }],
     });
     expect(await service.listTurns(userOwner, created.id)).toHaveLength(1);
+    database.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("preserves started and unstarted group timers across pause, restart, and independent chats", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const firstGroup: SessionOwner = { type: "group", id: "-100-paused" };
+    const secondGroup: SessionOwner = { type: "group", id: "-100-untimed" };
+    const firstService = makeService(database, {
+      ids: ["paused-session", "paused-turn", "untimed-session", "untimed-turn"],
+      now: () => 1_500,
+    });
+    const timedCreated = await firstService.createSession(firstGroup, "quest-version-1", 901);
+    const timedStarted = await firstService.startSession(firstGroup, timedCreated.id, 0, {
+      voteDurationMs: 60_000,
+      defaultChoiceIndex: 0,
+    });
+    const timedTurnId = timedStarted.turns[0]!.id;
+    expect(await readTurnTimer(database, timedTurnId)).toMatchObject({
+      deadline_at_ms: null,
+      remaining_ms: null,
+    });
+    await database.write((executor) => executor.run(
+      `UPDATE turn SET deadline_at_ms = ?, interactive_message_id = ? WHERE id = ?`,
+      2_000,
+      77,
+      timedTurnId,
+    ));
+
+    const paused = await firstService.pauseSession(firstGroup, timedCreated.id, 1);
+    expect(paused).toMatchObject({ status: "paused", stateVersion: 2 });
+    expect(await readTurnTimer(database, timedTurnId)).toMatchObject({
+      vote_duration_ms: 60_000,
+      deadline_at_ms: null,
+      remaining_ms: 500,
+      interactive_message_id: 77,
+    });
+    await expectSessionError(
+      firstService.applyDecision(firstGroup, timedCreated.id, timedTurnId, 0, 2, 902, {
+        voteDurationMs: 60_000,
+        defaultChoiceIndex: 0,
+      }),
+      "INVALID_TRANSITION",
+    );
+
+    const untimedCreated = await firstService.createSession(secondGroup, "quest-version-1", 903);
+    const untimedStarted = await firstService.startSession(secondGroup, untimedCreated.id, 0, {
+      voteDurationMs: 60_000,
+      defaultChoiceIndex: 1,
+    });
+    expect(await readTurnTimer(database, untimedStarted.turns[0]!.id)).toMatchObject({
+      deadline_at_ms: null,
+      remaining_ms: null,
+    });
+    database.close();
+
+    const recoveredDatabase = new LocalFileDatabase(temporary.url);
+    openDatabases.add(recoveredDatabase);
+    const resumeService = makeService(recoveredDatabase, { now: () => 10_000 });
+    expect(await resumeService.getSession(firstGroup, timedCreated.id)).toMatchObject({
+      status: "paused",
+      stateVersion: 2,
+      inkState: timedStarted.inkState,
+    });
+    const resumed = await resumeService.resumeSession(firstGroup, timedCreated.id, 2);
+    expect(resumed).toMatchObject({ status: "active", stateVersion: 3 });
+    expect(await readTurnTimer(recoveredDatabase, timedTurnId)).toMatchObject({
+      deadline_at_ms: 10_500,
+      remaining_ms: null,
+    });
+
+    const untimedPaused = await resumeService.pauseSession(secondGroup, untimedCreated.id, 1);
+    const untimedResumeService = makeService(recoveredDatabase, { now: () => 20_000 });
+    const untimedResumed = await untimedResumeService.resumeSession(
+      secondGroup,
+      untimedCreated.id,
+      untimedPaused.stateVersion,
+    );
+    expect(untimedResumed).toMatchObject({ status: "active", stateVersion: 3 });
+    expect(await readTurnTimer(recoveredDatabase, untimedStarted.turns[0]!.id)).toMatchObject({
+      deadline_at_ms: null,
+      remaining_ms: null,
+    });
+
+    const stopped = await untimedResumeService.stopSession(firstGroup, timedCreated.id, 3);
+    expect(stopped).toMatchObject({
+      status: "completed",
+      stateVersion: 4,
+      outcome: "stopped_by_owner",
+      finalScene: null,
+      turns: [],
+    });
+    expect(await readTurnTimer(recoveredDatabase, timedTurnId)).toMatchObject({
+      deadline_at_ms: null,
+      remaining_ms: null,
+    });
+    expect(await resumeService.getSession(secondGroup, untimedCreated.id)).toMatchObject({
+      status: "active",
+      stateVersion: 3,
+    });
+    recoveredDatabase.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("stops a created session and restarts a confirmed run after clearing turns and votes", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const group: SessionOwner = { type: "group", id: "-100-restart" };
+    const service = makeService(database, {
+      ids: [
+        "created-stop-session",
+        "restart-session",
+        "old-turn-1",
+        "fresh-turn-1",
+        "fresh-turn-2",
+      ],
+    });
+    const created = await service.createSession(userOwner, "quest-version-1", 1_001);
+    const stoppedCreated = await service.stopSession(userOwner, created.id, 0);
+    expect(stoppedCreated).toMatchObject({
+      status: "completed",
+      stateVersion: 1,
+      outcome: "stopped_by_owner",
+      inkState: null,
+      turns: [],
+    });
+
+    const restartCreated = await service.createSession(group, "quest-version-1", 1_002);
+    const started = await service.startSession(group, restartCreated.id, 0, {
+      voteDurationMs: 30_000,
+      defaultChoiceIndex: 0,
+    });
+    const oldTurnId = started.turns[0]!.id;
+    await database.write((executor) => executor.run(
+      `UPDATE turn SET deadline_at_ms = ?, interactive_message_id = ? WHERE id = ?`,
+      1_800_000_000_000,
+      88,
+      oldTurnId,
+    ));
+    await addTestVote(database, oldTurnId, "voter-before-restart");
+
+    const restarted = await service.restartSession(group, restartCreated.id, 1, true, {
+      voteDurationMs: 30_000,
+      defaultChoiceIndex: 1,
+    });
+    const newTurnId = restarted.turns[0]!.id;
+    expect(restarted).toMatchObject({
+      id: restartCreated.id,
+      questVersionId: "quest-version-1",
+      status: "active",
+      stateVersion: 2,
+      turns: [{ stepNumber: 1, decision: null }],
+    });
+    expect(newTurnId).not.toBe(oldTurnId);
+    expect(await service.listTurns(group, restartCreated.id)).toHaveLength(1);
+    expect(await countVotes(database, oldTurnId)).toBe(0);
+    expect(await readTurnTimer(database, newTurnId)).toMatchObject({
+      default_choice_index: 1,
+      vote_duration_ms: 30_000,
+      deadline_at_ms: null,
+      remaining_ms: null,
+      interactive_message_id: null,
+    });
+
+    await expectSessionError(
+      service.applyDecision(group, restartCreated.id, oldTurnId, 0, restarted.stateVersion, 1_003, {
+        voteDurationMs: 30_000,
+        defaultChoiceIndex: 1,
+      }),
+      "INVALID_TRANSITION",
+    );
+    const next = await service.applyDecision(group, restartCreated.id, newTurnId, 0, 2, 1_004, {
+      voteDurationMs: 30_000,
+      defaultChoiceIndex: 1,
+    });
+    const completed = await service.applyDecision(
+      group,
+      restartCreated.id,
+      next.turns[0]!.id,
+      0,
+      next.stateVersion,
+      1_005,
+      { voteDurationMs: 30_000, defaultChoiceIndex: 1 },
+    );
+    expect(completed).toMatchObject({ status: "completed", outcome: "story_completed" });
+    await expectSessionError(
+      service.rewindSession(group, restartCreated.id, 1, completed.stateVersion),
+      "INVALID_TRANSITION",
+    );
+    database.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("rewinds active and paused group history irreversibly and cascades votes", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const group: SessionOwner = { type: "group", id: "-100-rewind" };
+    const service = makeService(database, {
+      ids: [
+        "rewind-session",
+        "old-turn-1",
+        "old-turn-2",
+        "replacement-turn-1",
+        "replacement-turn-2",
+      ],
+    });
+    const created = await service.createSession(group, "quest-version-1", 1_101);
+    const started = await service.startSession(group, created.id, 0, {
+      voteDurationMs: 60_000,
+      defaultChoiceIndex: 1,
+    });
+    const oldTurn1 = started.turns[0]!;
+    await database.write((executor) => executor.run(
+      `UPDATE turn SET deadline_at_ms = ?, interactive_message_id = ? WHERE id = ?`,
+      1_800_000_000_000,
+      91,
+      oldTurn1.id,
+    ));
+    await addTestVote(database, oldTurn1.id, "rewind-voter-1");
+    const afterFirstChoice = await service.applyDecision(
+      group,
+      created.id,
+      oldTurn1.id,
+      0,
+      started.stateVersion,
+      1_102,
+      { voteDurationMs: 60_000, defaultChoiceIndex: 1 },
+    );
+    const oldTurn2 = afterFirstChoice.turns[0]!;
+    await database.write((executor) => executor.run(
+      `UPDATE turn SET deadline_at_ms = ?, interactive_message_id = ? WHERE id = ?`,
+      1_800_000_000_100,
+      92,
+      oldTurn2.id,
+    ));
+    await addTestVote(database, oldTurn2.id, "rewind-voter-2");
+
+    const rewound = await service.rewindSession(
+      group,
+      created.id,
+      1,
+      afterFirstChoice.stateVersion,
+    );
+    const replacementTurn1 = rewound.turns[0]!;
+    expect(rewound).toMatchObject({
+      status: "active",
+      stateVersion: 3,
+      inkState: oldTurn1.inkCheckpoint,
+      turns: [{ stepNumber: 1, sceneText: oldTurn1.sceneText, choices: oldTurn1.choices, decision: null }],
+    });
+    expect(replacementTurn1.id).not.toBe(oldTurn1.id);
+    expect(await service.listTurns(group, created.id)).toHaveLength(1);
+    expect(await countVotes(database, oldTurn1.id)).toBe(0);
+    expect(await countVotes(database, oldTurn2.id)).toBe(0);
+    expect(await readTurnTimer(database, replacementTurn1.id)).toMatchObject({
+      default_choice_index: 1,
+      vote_duration_ms: 60_000,
+      deadline_at_ms: null,
+      remaining_ms: null,
+      interactive_message_id: null,
+    });
+    await expectSessionError(
+      service.applyDecision(group, created.id, oldTurn1.id, 0, 3, 1_103, {
+        voteDurationMs: 60_000,
+        defaultChoiceIndex: 1,
+      }),
+      "INVALID_TRANSITION",
+    );
+
+    await addTestVote(database, replacementTurn1.id, "kept-voter");
+    const newStep2 = await service.applyDecision(
+      group,
+      created.id,
+      replacementTurn1.id,
+      1,
+      rewound.stateVersion,
+      1_104,
+      { voteDurationMs: 60_000, defaultChoiceIndex: 1 },
+    );
+    const paused = await service.pauseSession(group, created.id, newStep2.stateVersion);
+    const oldCurrentTurn2Id = newStep2.turns[0]!.id;
+    await database.write((executor) => executor.run(
+      `UPDATE turn SET deadline_at_ms = ?, interactive_message_id = ? WHERE id = ?`,
+      1_800_000_000_200,
+      93,
+      oldCurrentTurn2Id,
+    ));
+    await addTestVote(database, oldCurrentTurn2Id, "paused-rewind-voter");
+    const pausedRewind = await service.rewindSession(group, created.id, 2, paused.stateVersion);
+
+    expect(pausedRewind).toMatchObject({
+      status: "paused",
+      stateVersion: paused.stateVersion + 1,
+      turns: [{ stepNumber: 2, decision: null }],
+    });
+    expect(pausedRewind.turns[0]?.id).not.toBe(oldCurrentTurn2Id);
+    expect(await countVotes(database, replacementTurn1.id)).toBe(1);
+    expect(await countVotes(database, oldCurrentTurn2Id)).toBe(0);
+    expect(await service.listTurns(group, created.id)).toMatchObject([
+      { stepNumber: 1, decision: { choiceIndex: 1 } },
+      { stepNumber: 2, decision: null },
+    ]);
+    expect(await readTurnTimer(database, pausedRewind.turns[0]!.id)).toMatchObject({
+      deadline_at_ms: null,
+      remaining_ms: null,
+      interactive_message_id: null,
+    });
+
+    const resumed = await service.resumeSession(group, created.id, pausedRewind.stateVersion);
+    await expectSessionError(
+      service.applyDecision(group, created.id, oldCurrentTurn2Id, 0, resumed.stateVersion, 1_105, {
+        voteDurationMs: 60_000,
+        defaultChoiceIndex: 1,
+      }),
+      "INVALID_TRANSITION",
+    );
     database.close();
   }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
 

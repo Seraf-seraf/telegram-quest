@@ -94,6 +94,25 @@ export interface ApplyDecisionRecord {
   result: ActiveDecisionResult | CompletedDecisionResult;
 }
 
+export interface SessionTransitionRecord {
+  sessionId: string;
+  owner: SessionOwner;
+  expectedStateVersion: number;
+}
+
+export interface PauseSessionRecord extends SessionTransitionRecord {
+  nowMs: number;
+}
+
+export interface ResumeSessionRecord extends SessionTransitionRecord {
+  nowMs: number;
+}
+
+export interface RewindSessionRecord extends SessionTransitionRecord {
+  targetStepNo: number;
+  newTurnId: string;
+}
+
 export interface SessionStore {
   /** Atomically records the operation and inserts a created session. */
   createSession(input: CreateSessionRecord): Promise<Session>;
@@ -107,4 +126,14 @@ export interface SessionStore {
   hasProcessedOperation(operationId: number): Promise<boolean>;
   /** Rechecks the current turn and atomically records the decision, next state and operation ID. */
   applyDecision(input: ApplyDecisionRecord): Promise<Session>;
+  /** Pauses the session and transfers an active timer deadline into remaining milliseconds. */
+  pauseSession(input: PauseSessionRecord): Promise<Session>;
+  /** Resumes the session and restores an unexpired timer deadline from remaining milliseconds. */
+  resumeSession(input: ResumeSessionRecord): Promise<Session>;
+  /** Completes the session with stopped_by_owner and stops any current timer. */
+  stopSession(input: SessionTransitionRecord): Promise<Session>;
+  /** Destructively replaces all prior turns with a new run on the same pinned quest version. */
+  restartSession(input: StartSessionRecord): Promise<Session>;
+  /** Replaces the target turn and later history with a fresh turn at its saved Ink checkpoint. */
+  rewindSession(input: RewindSessionRecord): Promise<Session>;
 }
