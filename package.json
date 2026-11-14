@@ -16,6 +16,7 @@
     "vitest": "5.1.0"
   },
   "dependencies": {
-    "grammy": "1.46.0"
+    "grammy": "1.46.0",
+    "inkjs": "2.4.0"
   }
 }

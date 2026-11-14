@@ -20,8 +20,13 @@ export type SessionOwner =
 
 export type SessionStatus = "created" | "active" | "paused" | "completed";
 
-export type InkState = unknown;
-export type Choice = string;
+export type InkState = string;
+
+export interface Choice {
+  index: number;
+  text: string;
+  tags: string[];
+}
 export type Outcome = string;
 
 export interface Decision {
