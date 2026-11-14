@@ -51,4 +51,10 @@ export interface Session {
   stateVersion: number;
   turns: Turn[];
   outcome: Outcome | null;
+  finalScene: FinalScene | null;
+}
+
+export interface FinalScene {
+  text: string;
+  tags: string[];
 }

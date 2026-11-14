@@ -4,6 +4,8 @@ import {
   initializeApp,
   type BootstrapDependencies,
 } from "./bootstrap.js";
+import { SessionService } from "./app/sessions.js";
+import type { StorySource } from "./app/story-source.js";
 import type { TursoDatabase } from "./adapters/turso/client.js";
 
 function createFakeDatabase(): TursoDatabase & { closed: boolean } {
@@ -58,7 +60,21 @@ describe("initializeApp", () => {
     ]);
     expect(result.database).toBe(database);
     expect(result.storyRuntime).toBeDefined();
+    expect(result).not.toHaveProperty("sessions");
     expect(database.closed).toBe(false);
+  });
+
+  it("composes the session service only when an explicit story source is provided", async () => {
+    const database = createFakeDatabase();
+    const storySource: StorySource = {
+      load: async () => "compiled-story-fixture",
+    };
+
+    const result = await initializeApp(validEnv, dependencies(database, { storySource }));
+
+    expect(result.sessions).toBeInstanceOf(SessionService);
+    expect(result.sessions?.getSession).toBeTypeOf("function");
+    expect(result.storyRuntime).toBeDefined();
   });
 
   it("does not create a database for invalid config and logs no secret", async () => {

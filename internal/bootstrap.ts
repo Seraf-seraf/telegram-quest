@@ -1,12 +1,16 @@
 import { InkStoryRuntime } from "./adapters/ink/runtime.js";
 import { createTursoDatabase, type TursoDatabase } from "./adapters/turso/client.js";
 import { ensureSchema } from "./adapters/turso/migrate.js";
+import { createTursoSessionStore } from "./adapters/turso/store.js";
 import { loadStorageConfig } from "./config/env.js";
+import { SessionService } from "./app/sessions.js";
 import type { StoryRuntime } from "./app/story.js";
+import type { StorySource } from "./app/story-source.js";
 
 export interface ReadyApp {
   database: TursoDatabase;
   storyRuntime: StoryRuntime;
+  sessions?: SessionService;
 }
 
 export type BootstrapPhase = "configuration" | "connection" | "schema";
@@ -21,6 +25,7 @@ export interface BootstrapDependencies {
   createDatabase: typeof createTursoDatabase;
   ensureSchema: typeof ensureSchema;
   logFailure: (event: BootstrapFailureEvent) => void;
+  storySource?: StorySource;
 }
 
 const defaultDependencies: BootstrapDependencies = {
@@ -45,7 +50,18 @@ export async function initializeApp(
     phase = "schema";
     await dependencies.ensureSchema(database);
 
-    return { database, storyRuntime: new InkStoryRuntime() };
+    const storyRuntime = new InkStoryRuntime();
+    const readyApp: ReadyApp = { database, storyRuntime };
+
+    if (dependencies.storySource !== undefined) {
+      readyApp.sessions = new SessionService({
+        store: createTursoSessionStore(database),
+        storyRuntime,
+        storySource: dependencies.storySource,
+      });
+    }
+
+    return readyApp;
   } catch {
     database?.close();
     dependencies.logFailure({
