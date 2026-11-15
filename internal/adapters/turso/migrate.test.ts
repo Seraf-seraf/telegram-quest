@@ -181,16 +181,42 @@ function wrapDatabase(
 }
 
 describe("ensureSchema with local libSQL", () => {
+  it("initializes when the database rejects writes to PRAGMA user_version", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+    const restrictedDatabase = wrapDatabase(database, (executor) => ({
+      ...executor,
+      run: async (sql, ...args) => {
+        if (/^PRAGMA\s+user_version\s*=/i.test(sql)) {
+          throw new Error("SQL not allowed statement: PRAGMA user_version");
+        }
+        await executor.run(sql, ...args);
+      },
+    }));
+
+    try {
+      await ensureSchema(restrictedDatabase);
+      await ensureSchema(restrictedDatabase);
+      const row = await database.read((executor) => executor.get(
+        "SELECT version FROM quest_schema_version WHERE id = 1",
+      ));
+      expect(Number(row?.version)).toBe(2);
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("migrates an empty v0 database to v2", async () => {
     const { directory, database } = await createTemporaryDatabase();
 
     try {
       await ensureSchema(database);
 
-      expect(await readVersion(database)).toBe(2);
+      expect(await readVersion(database)).toBe(0);
       expect(await readTableNames(database)).toEqual([
         "processed_update",
         "quest",
+        "quest_schema_version",
         "quest_version",
         "session",
         "turn",
@@ -216,14 +242,51 @@ describe("ensureSchema with local libSQL", () => {
       expect(await readVersion(database)).toBe(1);
 
       await ensureSchema(database);
+      await ensureSchema(database);
 
-      expect(await readVersion(database)).toBe(2);
+      expect(await readVersion(database)).toBe(1);
+      expect(await readTableNames(database)).toContain("quest_schema_version");
       const sessionColumns = await database.read(async (executor) => {
         const rows = await executor.all("PRAGMA table_info(session)");
         return rows.map((row) => row.name);
       });
       expect(sessionColumns).toContain("final_scene_text");
       expect(sessionColumns).toContain("final_scene_tags_json");
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("adopts an existing v2 database after validating its schema", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+    try {
+      await ensureSchema(database);
+      await database.write(async (executor) => {
+        await executor.exec("DROP TABLE quest_schema_version");
+        await executor.run("PRAGMA user_version = 2");
+      });
+      await ensureSchema(database);
+      expect(await readVersion(database)).toBe(2);
+      expect(await readTableNames(database)).toContain("quest_schema_version");
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an invalid stored schema version without modifying it", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+    try {
+      await ensureSchema(database);
+      await database.write((executor) => executor.run(
+        "UPDATE quest_schema_version SET version = 3 WHERE id = 1",
+      ));
+      await expect(ensureSchema(database)).rejects.toThrow("unsupported version");
+      const row = await database.read((executor) => executor.get(
+        "SELECT version FROM quest_schema_version WHERE id = 1",
+      ));
+      expect(Number(row?.version)).toBe(3);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
@@ -253,7 +316,7 @@ describe("ensureSchema with local libSQL", () => {
 
       expect(execCalls).toBe(0);
       expect(runCalls).toBe(0);
-      expect(await readVersion(database)).toBe(2);
+      expect(await readVersion(database)).toBe(0);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
@@ -419,7 +482,30 @@ describe("ensureSchema with local libSQL", () => {
       expect(await readTableNames(database)).toEqual([]);
 
       await ensureSchema(database);
-      expect(await readVersion(database)).toBe(2);
+      expect(await readVersion(database)).toBe(0);
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back schema changes when storing the version fails", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+    const failingDatabase = wrapDatabase(database, (executor) => ({
+      ...executor,
+      run: async (sql, ...args) => {
+        if (sql.startsWith("INSERT INTO quest_schema_version")) {
+          throw new Error("simulated version marker failure");
+        }
+        await executor.run(sql, ...args);
+      },
+    }));
+    try {
+      await expect(ensureSchema(failingDatabase)).rejects.toThrow("version marker failure");
+      expect(await readVersion(database)).toBe(0);
+      expect(await readTableNames(database)).toEqual([]);
+      await ensureSchema(database);
+      expect(await readTableNames(database)).toContain("quest_schema_version");
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
@@ -438,8 +524,8 @@ describe("ensureSchema with local libSQL", () => {
         ensureSchema(secondDatabase),
       ]);
 
-      expect(await readVersion(firstDatabase)).toBe(2);
-      expect(await readTableNames(firstDatabase)).toHaveLength(6);
+      expect(await readVersion(firstDatabase)).toBe(0);
+      expect(await readTableNames(firstDatabase)).toHaveLength(7);
     } finally {
       firstDatabase.close();
       secondDatabase.close();

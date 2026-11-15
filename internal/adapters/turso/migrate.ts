@@ -3,6 +3,7 @@ import type { SqlExecutor, SqlRow, TursoDatabase } from "./client.js";
 
 const WRITE_LOCK_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 const INITIAL_SCHEMA_OBJECT_COUNT = 10;
+const SCHEMA_VERSION_TABLE_SQL = "CREATE TABLE quest_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL CHECK (version >= 1))";
 
 const versionOneMigrationUrl = new URL("./migrations/001_initial.sql", import.meta.url);
 const versionTwoMigrationUrl = new URL(
@@ -204,8 +205,12 @@ async function readExpectedSchemaObjects(
 async function assertSchemaObjects(
   executor: SqlExecutor,
   version: 1 | 2,
+  withVersionTable = false,
 ): Promise<void> {
   const expectedObjects = await readExpectedSchemaObjects(version);
+  if (withVersionTable) {
+    expectedObjects.set("table:quest_schema_version", SCHEMA_VERSION_TABLE_SQL);
+  }
   const actualObjects = await readUserSchemaObjects(executor);
 
   if (actualObjects.length !== expectedObjects.size) {
@@ -285,12 +290,10 @@ async function migrateEmptyDatabase(executor: SqlExecutor): Promise<void> {
   const initialSql = await readFile(versionOneMigrationUrl, "utf8");
   const normalizedSql = normalizeInitialMigration(initialSql);
   await executor.exec(normalizedSql);
-  await executor.run("PRAGMA user_version = 1");
   await assertSchemaObjects(executor, 1);
 
   const terminalOutputSql = await readFile(versionTwoMigrationUrl, "utf8");
   await executor.exec(terminalOutputSql);
-  await executor.run("PRAGMA user_version = 2");
 }
 
 function isDatabaseBusy(error: unknown): boolean {
@@ -319,26 +322,34 @@ async function ensureSchemaInTransaction(executor: SqlExecutor): Promise<void> {
     throw new Error(`Turso schema version ${version} is invalid.`);
   }
 
-  if (version === 0) {
-    const schemaObjects = await readUserSchemaObjects(executor);
+  const schemaObjects = await readUserSchemaObjects(executor);
+  const hasVersionTable = schemaObjects.some((row) => row.name === "quest_schema_version");
+  if (hasVersionTable) {
+    await assertSchemaObjects(executor, 2, true);
+    const rows = await executor.all("SELECT id, version FROM quest_schema_version");
+    if (rows.length !== 1 || readInteger(rows[0], "id") !== 1 ||
+      readInteger(rows[0], "version") !== 2) {
+      throw new Error("Turso schema version table contains an unsupported version.");
+    }
+    return;
+  }
 
+  if (version === 0) {
     if (schemaObjects.length !== 0) {
       throw new Error("Turso has unversioned schema objects; refusing to modify an unknown schema.");
     }
 
     await migrateEmptyDatabase(executor);
-    await assertSchemaObjects(executor, 2);
-    return;
-  }
-
-  if (version === 1) {
+  } else if (version === 1) {
     await assertSchemaObjects(executor, 1);
     const terminalOutputSql = await readFile(versionTwoMigrationUrl, "utf8");
     await executor.exec(terminalOutputSql);
-    await executor.run("PRAGMA user_version = 2");
   }
 
   await assertSchemaObjects(executor, 2);
+  await executor.exec(SCHEMA_VERSION_TABLE_SQL);
+  await executor.run("INSERT INTO quest_schema_version (id, version) VALUES (1, 2)");
+  await assertSchemaObjects(executor, 2, true);
 }
 
 export async function ensureSchema(database: TursoDatabase): Promise<void> {
