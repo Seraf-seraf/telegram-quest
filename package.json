@@ -10,8 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build:cli": "tsc -p tsconfig.cli.json",
-    "quest:publish": "npm run build:cli && node dist/cmd/publish-quest.js",
-    "vercel:build": "if [ \"$VERCEL_ENV\" = \"production\" ]; then npm run quest:publish -- --menu ./menu.json; else npm run build:cli; fi"
+    "quest:publish": "npm run build:cli && node dist/cmd/publish-quest.js"
   },
   "devDependencies": {
     "@libsql/client": "0.18.0",
