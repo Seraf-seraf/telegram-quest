@@ -30,6 +30,7 @@ function dependencies(
   return {
     createDatabase: () => database,
     ensureSchema: async () => undefined,
+    ensureDemoCatalog: async () => undefined,
     logFailure: () => undefined,
     ...overrides,
   };
@@ -41,7 +42,7 @@ const validEnv = {
 };
 
 describe("initializeApp", () => {
-  it("validates storage config, migrates schema, then builds the runtime", async () => {
+  it("validates config, ensures schema and catalog, then builds ready services", async () => {
     const database = createFakeDatabase();
     const calls: string[] = [];
     const result = await initializeApp(validEnv, dependencies(database, {
@@ -52,19 +53,24 @@ describe("initializeApp", () => {
       ensureSchema: async (receivedDatabase) => {
         calls.push(`schema:${receivedDatabase === database}`);
       },
+      ensureDemoCatalog: async (receivedDatabase, storySource) => {
+        calls.push(`catalog:${receivedDatabase === database}:${typeof storySource.load}`);
+      },
     }));
 
     expect(calls).toEqual([
       "connect:libsql://quest-example.turso.io",
       "schema:true",
+      "catalog:true:function",
     ]);
     expect(result.database).toBe(database);
     expect(result.storyRuntime).toBeDefined();
-    expect(result).not.toHaveProperty("sessions");
+    expect(result.sessions).toBeInstanceOf(SessionService);
+    expect(result.catalog.listAvailableQuests).toBeTypeOf("function");
     expect(database.closed).toBe(false);
   });
 
-  it("composes the session service only when an explicit story source is provided", async () => {
+  it("uses an injected story source for tests without changing the ready app contract", async () => {
     const database = createFakeDatabase();
     const storySource: StorySource = {
       load: async () => "compiled-story-fixture",
@@ -73,7 +79,8 @@ describe("initializeApp", () => {
     const result = await initializeApp(validEnv, dependencies(database, { storySource }));
 
     expect(result.sessions).toBeInstanceOf(SessionService);
-    expect(result.sessions?.getSession).toBeTypeOf("function");
+    expect(result.sessions.getSession).toBeTypeOf("function");
+    expect(result.catalog.listVersions).toBeTypeOf("function");
     expect(result.storyRuntime).toBeDefined();
   });
 
@@ -118,6 +125,26 @@ describe("initializeApp", () => {
       code: "APP_INITIALIZATION_FAILED",
     });
     expect(JSON.stringify(logFailure.mock.calls)).not.toContain("auth token");
+  });
+
+  it("closes storage and emits a safe event when demo catalog initialization fails", async () => {
+    const database = createFakeDatabase();
+    const logFailure = vi.fn();
+
+    await expect(initializeApp(validEnv, dependencies(database, {
+      ensureDemoCatalog: async () => {
+        throw new Error("database URL and token must stay private");
+      },
+      logFailure,
+    }))).rejects.toThrow("Application initialization failed.");
+
+    expect(database.closed).toBe(true);
+    expect(logFailure).toHaveBeenCalledWith({
+      event: "telegram_quest.bootstrap_failed",
+      phase: "catalog",
+      code: "APP_INITIALIZATION_FAILED",
+    });
+    expect(JSON.stringify(logFailure.mock.calls)).not.toContain("token");
   });
 });
 

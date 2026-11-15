@@ -1,8 +1,12 @@
 import { InkStoryRuntime } from "./adapters/ink/runtime.js";
+import { createTursoQuestCatalog } from "./adapters/turso/catalog.js";
 import { createTursoDatabase, type TursoDatabase } from "./adapters/turso/client.js";
 import { ensureSchema } from "./adapters/turso/migrate.js";
+import { ensureDemoCatalog } from "./adapters/turso/seed.js";
 import { createTursoSessionStore } from "./adapters/turso/store.js";
+import { BundledStorySource } from "./adapters/ink/bundled-story-source.js";
 import { loadStorageConfig } from "./config/env.js";
+import type { QuestCatalog } from "./app/quest-catalog.js";
 import { SessionService } from "./app/sessions.js";
 import type { StoryRuntime } from "./app/story.js";
 import type { StorySource } from "./app/story-source.js";
@@ -10,10 +14,11 @@ import type { StorySource } from "./app/story-source.js";
 export interface ReadyApp {
   database: TursoDatabase;
   storyRuntime: StoryRuntime;
-  sessions?: SessionService;
+  sessions: SessionService;
+  catalog: QuestCatalog;
 }
 
-export type BootstrapPhase = "configuration" | "connection" | "schema";
+export type BootstrapPhase = "configuration" | "connection" | "schema" | "catalog";
 
 export interface BootstrapFailureEvent {
   event: "telegram_quest.bootstrap_failed";
@@ -26,6 +31,7 @@ export interface BootstrapDependencies {
   ensureSchema: typeof ensureSchema;
   logFailure: (event: BootstrapFailureEvent) => void;
   storySource?: StorySource;
+  ensureDemoCatalog?: typeof ensureDemoCatalog;
 }
 
 const defaultDependencies: BootstrapDependencies = {
@@ -50,18 +56,23 @@ export async function initializeApp(
     phase = "schema";
     await dependencies.ensureSchema(database);
 
-    const storyRuntime = new InkStoryRuntime();
-    const readyApp: ReadyApp = { database, storyRuntime };
-
-    if (dependencies.storySource !== undefined) {
-      readyApp.sessions = new SessionService({
-        store: createTursoSessionStore(database),
-        storyRuntime,
-        storySource: dependencies.storySource,
-      });
+    const storySource = dependencies.storySource ?? new BundledStorySource();
+    if (dependencies.storySource === undefined || dependencies.ensureDemoCatalog !== undefined) {
+      phase = "catalog";
+      await (dependencies.ensureDemoCatalog ?? ensureDemoCatalog)(database, storySource);
     }
 
-    return readyApp;
+    const storyRuntime = new InkStoryRuntime();
+    return {
+      database,
+      storyRuntime,
+      sessions: new SessionService({
+        store: createTursoSessionStore(database),
+        storyRuntime,
+        storySource,
+      }),
+      catalog: createTursoQuestCatalog(database),
+    };
   } catch {
     database?.close();
     dependencies.logFailure({
