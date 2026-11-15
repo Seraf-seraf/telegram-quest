@@ -520,6 +520,9 @@ describe("private quest Telegram handlers", () => {
     const getApplication = vi.fn(async () => ({
       catalog: {
         listAvailableQuests: vi.fn(async () => []),
+        listQuestsPage: vi.fn(async () => ({ items: [], page: 1, totalItems: 0, totalPages: 0 })),
+        listGenresPage: vi.fn(async () => ({ items: [], page: 1, totalItems: 0, totalPages: 0 })),
+        resolveGenreKey: vi.fn(async () => null),
         getQuest: app.catalog.getQuest.bind(app.catalog),
       },
       sessions: app.sessions,

@@ -339,6 +339,25 @@ describe("Turso session store with local libSQL", () => {
     expect(secondPage.sessions.map((session) => session.id)).toEqual(["session-c"]);
     expect(secondPage.nextCursor).toBeNull();
     expect(secondPage.sessions[0]).not.toHaveProperty("turns");
+    expect(await store.listOwnedSessionsPage(userOwner, 1)).toMatchObject({
+      page: 1,
+      totalItems: 3,
+      totalPages: 1,
+      items: [{ id: "session-a" }, { id: "session-b" }, { id: "session-c" }],
+    });
+    expect(await store.listOwnedSessionsPage({ type: "user", id: "nobody" }, 4)).toMatchObject({
+      page: 1,
+      items: [],
+      totalItems: 0,
+      totalPages: 0,
+    });
+    await service.startSession(userOwner, "session-a", 0);
+    const turnSummaries = await store.listTurnSummariesPage(userOwner, "session-a", 1);
+    expect(turnSummaries).toMatchObject({ page: 1, totalItems: 1, totalPages: 1 });
+    expect(turnSummaries.items[0]).toHaveProperty("stepNumber", 1);
+    expect(turnSummaries.items[0]).toHaveProperty("sceneText");
+    expect(turnSummaries.items[0]).not.toHaveProperty("inkCheckpoint");
+    await expect(store.listTurnSummariesPage(groupOwner, "session-a", 1)).rejects.toMatchObject({ code: "FORBIDDEN_OWNER" });
     expect(await store.listOwnedSessions(groupOwner, 2, null)).toMatchObject({
       sessions: [{ id: "session-d", status: "created" }],
       nextCursor: null,

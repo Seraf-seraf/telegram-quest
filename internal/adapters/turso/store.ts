@@ -21,7 +21,9 @@ import {
   type SessionStore,
   type SessionTransitionRecord,
   type StartSessionRecord,
+  type TurnSummary,
 } from "../../app/session-store.js";
+import { createPage, pageOffset, PAGE_SIZE } from "../../app/pagination.js";
 import type { SqlExecutor, SqlRow, TursoDatabase } from "./client.js";
 
 function invalidStorageData(label: string): SessionError {
@@ -682,6 +684,61 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           sessions,
           nextCursor: hasNextPage ? sessions.at(-1)?.id ?? null : null,
         };
+      });
+    },
+
+    async listOwnedSessionsPage(owner: SessionOwner, requestedPage: number) {
+      return inRead(async (executor) => {
+        const countRow = await executor.get(
+          `SELECT COUNT(*) AS total_items
+             FROM session
+             JOIN quest ON quest.id = session.quest_id
+            WHERE session.owner_type = ? AND session.owner_id = ?`,
+          owner.type,
+          owner.id,
+        );
+        const totalItems = readInteger(countRow ?? {}, "total_items");
+        const totalPages = Math.ceil(totalItems / PAGE_SIZE);
+        const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+        const rows = await executor.all(
+          `SELECT session.id, session.quest_id, session.status,
+                  session.state_version, quest.title AS quest_title
+             FROM session
+             JOIN quest ON quest.id = session.quest_id
+            WHERE session.owner_type = ? AND session.owner_id = ?
+            ORDER BY session.id COLLATE BINARY ASC
+            LIMIT ? OFFSET ?`,
+          owner.type,
+          owner.id,
+          PAGE_SIZE,
+          pageOffset(page, PAGE_SIZE),
+        );
+        return createPage(rows.map(mapOwnedSessionSummary), totalItems, page, PAGE_SIZE);
+      });
+    },
+
+    async listTurnSummariesPage(owner: SessionOwner, sessionId: string, requestedPage: number) {
+      return inRead(async (executor) => {
+        await requireOwnedSession(executor, owner, sessionId);
+        const countRow = await executor.get(
+          "SELECT COUNT(*) AS total_items FROM turn WHERE session_id = ?",
+          sessionId,
+        );
+        const totalItems = readInteger(countRow ?? {}, "total_items");
+        const totalPages = Math.ceil(totalItems / PAGE_SIZE);
+        const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+        const rows = await executor.all(
+          `SELECT step_no, scene_text FROM turn
+            WHERE session_id = ? ORDER BY step_no ASC LIMIT ? OFFSET ?`,
+          sessionId,
+          PAGE_SIZE,
+          pageOffset(page, PAGE_SIZE),
+        );
+        const items: TurnSummary[] = rows.map((row) => ({
+          stepNumber: readInteger(row, "step_no"),
+          sceneText: readString(row, "scene_text"),
+        }));
+        return createPage(items, totalItems, page, PAGE_SIZE);
       });
     },
 

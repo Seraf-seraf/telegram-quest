@@ -6,6 +6,7 @@ import type {
   SessionStatus,
   Turn,
 } from "../domain/model.js";
+import type { Page } from "./pagination.js";
 
 export type SessionErrorCode =
   | "CONFLICT"
@@ -44,6 +45,11 @@ export interface OwnedSessionSummary {
 export interface OwnedSessionPage {
   sessions: OwnedSessionSummary[];
   nextCursor: string | null;
+}
+
+export interface TurnSummary {
+  stepNumber: number;
+  sceneText: string;
 }
 
 export interface CreateSessionRecord {
@@ -136,6 +142,8 @@ export interface SessionStore {
     limit: number,
     cursor: string | null,
   ): Promise<OwnedSessionPage>;
+  listOwnedSessionsPage(owner: SessionOwner, page: number): Promise<Page<OwnedSessionSummary>>;
+  listTurnSummariesPage(owner: SessionOwner, sessionId: string, page: number): Promise<Page<TurnSummary>>;
   listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]>;
   /** Compares owner, quest and state version, then persists state and the first turn atomically. */
   startSession(input: StartSessionRecord): Promise<Session>;

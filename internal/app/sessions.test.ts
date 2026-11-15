@@ -295,6 +295,8 @@ function makeStore(options: {
     getQuest,
     getSession,
     listOwnedSessions,
+    listOwnedSessionsPage: vi.fn(async () => ({ items: [], page: 1, totalItems: 0, totalPages: 0 })),
+    listTurnSummariesPage: vi.fn(async () => ({ items: [], page: 1, totalItems: 0, totalPages: 0 })),
     listTurns,
     startSession,
     hasProcessedOperation,

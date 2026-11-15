@@ -13,10 +13,13 @@ import {
   type ResumeSessionRecord,
   type RewindSessionRecord,
   type OwnedSessionPage,
+  type OwnedSessionSummary,
   type SessionTransitionRecord,
   type StartSessionRecord,
   type SessionStore,
+  type TurnSummary,
 } from "./session-store.js";
+import { assertPageNumber, type Page } from "./pagination.js";
 import { StoryRuntimeError, type StoryRuntime, type StoryStep } from "./story.js";
 import { StorySourceError, type StorySource } from "./story-source.js";
 
@@ -562,6 +565,21 @@ export class SessionService {
   public listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]> {
     assertOwner(owner);
     return this.store.listTurns(owner, sessionId);
+  }
+
+  public listOwnedSessionsPage(owner: SessionOwner, page: number): Promise<Page<OwnedSessionSummary>> {
+    assertOwner(owner);
+    assertPageNumber(page);
+    return this.store.listOwnedSessionsPage(owner, page);
+  }
+
+  public listTurnSummariesPage(owner: SessionOwner, sessionId: string, page: number): Promise<Page<TurnSummary>> {
+    assertOwner(owner);
+    assertPageNumber(page);
+    if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.trim() !== sessionId) {
+      throw new SessionError("INVALID_TRANSITION", "Session ID is invalid.");
+    }
+    return this.store.listTurnSummariesPage(owner, sessionId, page);
   }
 
   private async getExpectedSession(
