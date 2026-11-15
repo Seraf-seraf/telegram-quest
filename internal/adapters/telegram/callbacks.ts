@@ -11,7 +11,13 @@ export type PrivateQuestCallback =
   | { kind: "start"; versionId: string }
   | { kind: "sessions" }
   | { kind: "sessions_page"; cursor: string }
-  | { kind: "session"; sessionId: string };
+  | { kind: "session"; sessionId: string }
+  | {
+    kind: "choice";
+    sessionId: string;
+    stateVersion: number;
+    choiceIndex: number;
+  };
 
 export class CallbackDataError extends Error {
   public constructor() {
@@ -53,6 +59,22 @@ function decodeId(token: string | undefined): string | null {
     : null;
 }
 
+function encodeIndex(index: number): string {
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new CallbackDataError();
+  }
+  return index.toString(36);
+}
+
+function decodeIndex(token: string | undefined): number | null {
+  if (token === undefined || !/^(0|[1-9a-z][0-9a-z]*)$/.test(token)) {
+    return null;
+  }
+
+  const index = Number.parseInt(token, 36);
+  return Number.isSafeInteger(index) && index.toString(36) === token ? index : null;
+}
+
 function assertCallbackLength(data: string): string {
   if (Buffer.byteLength(data, "utf8") > MAX_CALLBACK_DATA_BYTES) {
     throw new CallbackDataError();
@@ -87,6 +109,9 @@ export function encodePrivateQuestCallback(callback: PrivateQuestCallback): stri
       break;
     case "session":
       data = `${CALLBACK_PROTOCOL_VERSION}:o:${encodeId(callback.sessionId)}`;
+      break;
+    case "choice":
+      data = `${CALLBACK_PROTOCOL_VERSION}:c:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodeIndex(callback.choiceIndex)}`;
       break;
     default: {
       const exhaustive: never = callback;
@@ -152,6 +177,17 @@ export function parsePrivateQuestCallback(data: unknown): PrivateQuestCallback |
       }
       const sessionId = decodeId(parts[2]);
       return sessionId === null ? null : { kind: "session", sessionId };
+    }
+    case "c": {
+      if (parts.length !== 5) {
+        return null;
+      }
+      const sessionId = decodeId(parts[2]);
+      const stateVersion = decodeIndex(parts[3]);
+      const choiceIndex = decodeIndex(parts[4]);
+      return sessionId === null || stateVersion === null || choiceIndex === null
+        ? null
+        : { kind: "choice", sessionId, stateVersion, choiceIndex };
     }
     default:
       return null;

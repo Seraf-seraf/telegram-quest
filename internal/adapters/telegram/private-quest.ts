@@ -1,5 +1,5 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
-import type { Quest } from "../../domain/model.js";
+import type { Session } from "../../domain/model.js";
 import { SessionError } from "../../app/session-store.js";
 import type { QuestCatalog } from "../../app/quest-catalog.js";
 import type { SessionService } from "../../app/sessions.js";
@@ -9,6 +9,7 @@ import {
   parsePrivateQuestCallback,
   type PrivateQuestCallback,
 } from "./callbacks.js";
+import { sendScene } from "./scene-presenter.js";
 
 const PRIVATE_SESSION_PAGE_ITEMS = 20;
 
@@ -16,12 +17,18 @@ export interface PrivateQuestApplication {
   catalog: QuestCatalog;
   sessions: Pick<
     SessionService,
-    "createSession" | "getSession" | "listOwnedSessions" | "startSession"
+    "applyDecision" | "createSession" | "getSession" | "listOwnedSessions" | "startSession"
   >;
 }
 
 type GetPrivateQuestApplication = () => Promise<PrivateQuestApplication>;
-type FailurePhase = "catalog" | "sessions" | "session_create" | "session_open";
+type FailurePhase =
+  | "catalog"
+  | "sessions"
+  | "session_create"
+  | "session_open"
+  | "session_decision"
+  | "scene";
 
 interface PrivateQuestFailureEvent {
   event: "telegram_quest.private_handler_failed";
@@ -79,6 +86,13 @@ function mainMenuKeyboard(): InlineKeyboard {
   return keyboard;
 }
 
+function sessionMenuKeyboard(): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Мои прохождения", { kind: "sessions" });
+  addButton(keyboard, "В меню", { kind: "menu" });
+  return keyboard;
+}
+
 function menuErrorText(error: unknown): string {
   if (error instanceof SessionError && error.code === "DUPLICATE_OPERATION") {
     return "Запрос уже обработан. Проверьте список в /sessions.";
@@ -128,10 +142,6 @@ async function showMainMenu(context: Context): Promise<void> {
   );
 }
 
-function questLabel(quest: Quest): string {
-  return `${quest.title} · ${quest.genre}`;
-}
-
 function statusLabel(status: string): string {
   switch (status) {
     case "created":
@@ -145,6 +155,29 @@ function statusLabel(status: string): string {
     default:
       return "сохранён";
   }
+}
+
+function createChoiceKeyboard(session: Session): {
+  keyboard: InlineKeyboard;
+  skippedChoices: number;
+} {
+  const keyboard = new InlineKeyboard();
+  const turn = session.turns[0];
+  let skippedChoices = 0;
+
+  for (const choice of turn?.choices ?? []) {
+    const label = choice.text.trim() || `Выбор ${choice.index + 1}`;
+    if (!addButton(keyboard, label, {
+      kind: "choice",
+      sessionId: session.id,
+      stateVersion: session.stateVersion,
+      choiceIndex: choice.index,
+    })) {
+      skippedChoices += 1;
+    }
+  }
+
+  return { keyboard, skippedChoices };
 }
 
 async function showQuestList(
@@ -267,29 +300,69 @@ async function showSessions(
   await showScreen(context, text, keyboard);
 }
 
+async function sendSessionOutput(
+  context: Context,
+  session: Session,
+  updateId: number,
+): Promise<void> {
+  const chatId = context.chatId;
+  if (chatId === undefined) {
+    throw new SessionError("INVALID_TRANSITION", "Private chat is unavailable.");
+  }
+
+  if (session.status === "completed") {
+    if (session.finalScene !== null) {
+      await sendScene(context.api, chatId, session.finalScene.text, updateId);
+    }
+    return;
+  }
+
+  const turn = session.turns[0];
+  if (turn === undefined) {
+    throw new SessionError("STORY_MISMATCH", "Session has no current turn.");
+  }
+
+  if (session.status === "active") {
+    const { keyboard, skippedChoices } = createChoiceKeyboard(session);
+    if (skippedChoices > 0) {
+      throw new CallbackDataError();
+    }
+    await sendScene(
+      context.api,
+      chatId,
+      turn.sceneText,
+      updateId,
+      keyboard.inline_keyboard.length === 0 ? undefined : keyboard,
+    );
+    return;
+  }
+
+  await sendScene(context.api, chatId, turn.sceneText, updateId);
+}
+
 async function showSession(
   context: Context,
   application: PrivateQuestApplication,
   owner: { type: "user"; id: string },
   sessionId: string,
+  updateId: number,
 ): Promise<void> {
-  const session = await application.sessions.getSession(owner, sessionId);
+  let session = await application.sessions.getSession(owner, sessionId);
+  if (session.status === "created") {
+    session = await application.sessions.startSession(owner, session.id, session.stateVersion);
+  }
+
   const version = await application.catalog.getQuestVersion(session.questVersionId);
   const quests = version === null ? [] : await application.catalog.listAvailableQuests();
   const quest = version === null ? undefined : quests.find((item) => item.id === version.questId);
   const title = quest?.title ?? "Квест";
   const versionText = version === null ? "" : ` · версия ${version.version}`;
-  const stepText = session.turns[0] === undefined
-    ? ""
-    : ` · ход ${session.turns[0].stepNumber}`;
-  const keyboard = new InlineKeyboard();
-  addButton(keyboard, "К прохождениям", { kind: "sessions" });
-  addButton(keyboard, "В меню", { kind: "menu" });
   await showScreen(
     context,
-    `${title}${versionText}\nСтатус: ${statusLabel(session.status)}${stepText}\n\nПрохождение найдено и сохранено.`,
-    keyboard,
+    `${title}${versionText}\nСтатус: ${statusLabel(session.status)}\n\nПродолжение загружено из сохранённого прохождения.`,
+    sessionMenuKeyboard(),
   );
+  await sendSessionOutput(context, session, updateId);
 }
 
 function failurePhase(callback: PrivateQuestCallback): FailurePhase {
@@ -299,6 +372,8 @@ function failurePhase(callback: PrivateQuestCallback): FailurePhase {
       return "sessions";
     case "session":
       return "session_open";
+    case "choice":
+      return "session_decision";
     case "start":
       return "session_create";
     case "menu":
@@ -306,6 +381,91 @@ function failurePhase(callback: PrivateQuestCallback): FailurePhase {
     case "quest":
     case "version":
       return "catalog";
+  }
+}
+
+function isExpectedChoiceFailure(error: unknown): boolean {
+  return error instanceof SessionError && [
+    "CONFLICT",
+    "DUPLICATE_OPERATION",
+    "FORBIDDEN_OWNER",
+    "INVALID_CHOICE",
+    "INVALID_TRANSITION",
+    "NOT_FOUND",
+  ].includes(error.code);
+}
+
+async function handleChoiceCallback(
+  context: Context,
+  getApplication: GetPrivateQuestApplication,
+  owner: { type: "user"; id: string },
+  callback: Extract<PrivateQuestCallback, { kind: "choice" }>,
+  logger: PrivateQuestLogger,
+): Promise<void> {
+  const refreshText = "Ход изменился. Откройте /sessions, чтобы увидеть продолжение.";
+  let application: PrivateQuestApplication;
+  let session: Session;
+
+  try {
+    application = await getApplication();
+    session = await application.sessions.getSession(owner, callback.sessionId);
+  } catch (error) {
+    logFailure(logger, "session_decision", error);
+    await context.answerCallbackQuery({ text: refreshText });
+    return;
+  }
+
+  const turn = session.turns[0];
+  if (
+    session.status !== "active" ||
+    session.stateVersion !== callback.stateVersion ||
+    turn === undefined ||
+    turn.decision !== null ||
+    !turn.choices.some((choice) => choice.index === callback.choiceIndex)
+  ) {
+    await context.answerCallbackQuery({ text: refreshText });
+    return;
+  }
+
+  let updated: Session;
+  try {
+    updated = await application.sessions.applyDecision(
+      owner,
+      session.id,
+      turn.id,
+      callback.choiceIndex,
+      callback.stateVersion,
+      context.update.update_id,
+    );
+  } catch (error) {
+    if (!isExpectedChoiceFailure(error)) {
+      logFailure(logger, "session_decision", error);
+    }
+    await context.answerCallbackQuery({ text: refreshText });
+    return;
+  }
+
+  try {
+    await context.answerCallbackQuery();
+  } catch (error) {
+    logFailure(logger, "scene", error);
+  }
+
+  try {
+    await context.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
+  } catch (error) {
+    logFailure(logger, "scene", error);
+  }
+
+  try {
+    await sendSessionOutput(context, updated, context.update.update_id);
+  } catch (error) {
+    logFailure(logger, "scene", error);
+    try {
+      await context.reply("Ход сохранён. Откройте /sessions, чтобы восстановить продолжение.");
+    } catch (recoveryError) {
+      logFailure(logger, "scene", recoveryError);
+    }
   }
 }
 
@@ -326,8 +486,14 @@ async function handleCallback(
     return;
   }
 
+  if (callback.kind === "choice") {
+    await handleChoiceCallback(context, getApplication, owner, callback, logger);
+    return;
+  }
+
   await context.answerCallbackQuery();
 
+  let activePhase = failurePhase(callback);
   try {
     const application = await getApplication();
     switch (callback.kind) {
@@ -344,6 +510,7 @@ async function handleCallback(
         await showVersion(context, application, callback.versionId);
         return;
       case "start": {
+        activePhase = "session_create";
         const version = await application.catalog.getQuestVersion(callback.versionId);
         if (version === null) {
           await showScreen(context, "Версия больше недоступна. Откройте каталог заново.", mainMenuKeyboard());
@@ -375,13 +542,8 @@ async function handleCallback(
           return;
         }
 
-        const keyboard = new InlineKeyboard();
-        addButton(keyboard, "Мои прохождения", { kind: "sessions" });
-        addButton(keyboard, "В меню", { kind: "menu" });
-        const text = started.status === "completed"
-          ? "Квест запущен и сразу завершён. Откройте /sessions."
-          : "Квест запущен. Продолжение сохранено в /sessions.";
-        await showScreen(context, text, keyboard);
+        activePhase = "scene";
+        await showSession(context, application, owner, started.id, context.update.update_id);
         return;
       }
       case "sessions":
@@ -391,11 +553,12 @@ async function handleCallback(
         await showSessions(context, application, owner, callback.cursor);
         return;
       case "session":
-        await showSession(context, application, owner, callback.sessionId);
+        activePhase = "session_open";
+        await showSession(context, application, owner, callback.sessionId, context.update.update_id);
         return;
     }
   } catch (error) {
-    logFailure(logger, failurePhase(callback), error);
+    logFailure(logger, activePhase, error);
     await showScreen(context, menuErrorText(error), mainMenuKeyboard());
   }
 }

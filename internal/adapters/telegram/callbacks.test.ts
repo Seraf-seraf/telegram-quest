@@ -18,6 +18,12 @@ describe("private quest callback protocol", () => {
       { kind: "sessions" },
       { kind: "sessions_page", cursor: "session-cursor" },
       { kind: "session", sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000" },
+      {
+        kind: "choice",
+        sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000",
+        stateVersion: 123,
+        choiceIndex: 11,
+      },
     ];
 
     for (const callback of callbacks) {
@@ -32,6 +38,18 @@ describe("private quest callback protocol", () => {
       .toThrow(CallbackDataError);
     expect(() => encodePrivateQuestCallback({ kind: "quest", questId: " padded " }))
       .toThrow(CallbackDataError);
+    expect(() => encodePrivateQuestCallback({
+      kind: "choice",
+      sessionId: "x".repeat(50),
+      stateVersion: 0,
+      choiceIndex: 0,
+    })).toThrow(CallbackDataError);
+    expect(() => encodePrivateQuestCallback({
+      kind: "choice",
+      sessionId: "session-a",
+      stateVersion: -1,
+      choiceIndex: 0,
+    })).toThrow(CallbackDataError);
   });
 
   it("returns null for malformed, non-canonical, unknown, and oversized callbacks", () => {
@@ -40,6 +58,9 @@ describe("private quest callback protocol", () => {
       "v1:m:extra",
       "v1:q:%%%",
       "v1:q:YQ==",
+      "v1:c:YQ:00:0",
+      "v1:c:YQ:zzzzzzzzzzzz:0",
+      "v1:c:YQ:1",
       "v1:unknown",
       `v1:q:${"a".repeat(80)}`,
     ];
