@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["cmd/publish-quest.ts"],
+  "exclude": ["node_modules", ".vercel", "dist", "**/*.test.ts"]
+}

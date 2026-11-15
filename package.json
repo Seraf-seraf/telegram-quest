@@ -8,7 +8,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:cli": "tsc -p tsconfig.cli.json",
+    "quest:publish": "npm run build:cli && node dist/cmd/publish-quest.js"
   },
   "devDependencies": {
     "@libsql/client": "0.18.0",
