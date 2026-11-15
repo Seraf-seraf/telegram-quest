@@ -44,6 +44,7 @@ function makeTurn(overrides: Partial<Turn> = {}): Turn {
     stepNumber: 1,
     inkCheckpoint: "checkpoint-json",
     sceneText: "A scene.",
+    sceneTags: [],
     choices: [{ index: 0, text: "Continue", tags: [] }],
     decision: null,
     ...overrides,

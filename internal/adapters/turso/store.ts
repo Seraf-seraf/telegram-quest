@@ -143,6 +143,22 @@ function parseChoicesJson(json: string): Choice[] {
   });
 }
 
+function parseSceneTagsJson(json: string): string[] {
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(json);
+  } catch (error) {
+    throw new SessionError("STORAGE_FAILURE", "Stored turn scene tags are invalid.", { cause: error });
+  }
+
+  if (!Array.isArray(parsed) || parsed.some((tag) => typeof tag !== "string")) {
+    throw invalidStorageData("turn scene tags");
+  }
+
+  return [...parsed];
+}
+
 function mapTurn(row: SqlRow): Turn {
   const decisionChoiceIndex = readNullableInteger(row, "decision_choice_index");
 
@@ -151,6 +167,7 @@ function mapTurn(row: SqlRow): Turn {
     stepNumber: readInteger(row, "step_no"),
     inkCheckpoint: readString(row, "ink_checkpoint_json"),
     sceneText: readString(row, "scene_text"),
+    sceneTags: parseSceneTagsJson(readString(row, "scene_tags_json")),
     choices: parseChoicesJson(readString(row, "choices_json")),
     decision: decisionChoiceIndex === null
       ? null
@@ -291,7 +308,8 @@ async function readTurns(
   sessionId: string,
 ): Promise<Turn[]> {
   const rows = await executor.all(
-    `SELECT id, step_no, ink_checkpoint_json, scene_text, choices_json, decision_choice_index
+    `SELECT id, step_no, ink_checkpoint_json, scene_text, scene_tags_json, choices_json,
+            decision_choice_index
        FROM turn
       WHERE session_id = ?
       ORDER BY step_no`,
@@ -328,6 +346,7 @@ async function readSession(
             turn.step_no AS current_step_no,
             turn.ink_checkpoint_json AS current_ink_checkpoint_json,
             turn.scene_text AS current_scene_text,
+            turn.scene_tags_json AS current_scene_tags_json,
             turn.choices_json AS current_choices_json,
             turn.decision_choice_index AS current_decision_choice_index
        FROM session
@@ -358,6 +377,7 @@ async function readSession(
       step_no: readInteger(row, "current_step_no"),
       ink_checkpoint_json: readString(row, "current_ink_checkpoint_json"),
       scene_text: readString(row, "current_scene_text"),
+      scene_tags_json: readString(row, "current_scene_tags_json"),
       choices_json: readString(row, "current_choices_json"),
       decision_choice_index: readNullableInteger(row, "current_decision_choice_index"),
     })];
@@ -730,15 +750,17 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           const turn = input.initialTurn.turn;
           await executor.run(
             `INSERT INTO turn (
-               id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+               id, session_id, step_no, ink_checkpoint_json, scene_text, scene_tags_json,
+               choices_json,
                default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
                interactive_message_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
             turn.id,
             input.sessionId,
             turn.stepNumber,
             turn.inkCheckpoint,
             turn.sceneText,
+            JSON.stringify(turn.sceneTags),
             JSON.stringify(turn.choices),
             input.initialTurn.defaultChoiceIndex,
             input.initialTurn.voteDurationMs,
@@ -874,15 +896,17 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           const turn = input.result.nextTurn.turn;
           await executor.run(
             `INSERT INTO turn (
-               id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+               id, session_id, step_no, ink_checkpoint_json, scene_text, scene_tags_json,
+               choices_json,
                default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
                interactive_message_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
             turn.id,
             input.sessionId,
             turn.stepNumber,
             turn.inkCheckpoint,
             turn.sceneText,
+            JSON.stringify(turn.sceneTags),
             JSON.stringify(turn.choices),
             input.result.nextTurn.defaultChoiceIndex,
             input.result.nextTurn.voteDurationMs,
@@ -1143,15 +1167,17 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           const turn = input.initialTurn.turn;
           await executor.run(
             `INSERT INTO turn (
-               id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+               id, session_id, step_no, ink_checkpoint_json, scene_text, scene_tags_json,
+               choices_json,
                default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
                interactive_message_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
             turn.id,
             input.sessionId,
             turn.stepNumber,
             turn.inkCheckpoint,
             turn.sceneText,
+            JSON.stringify(turn.sceneTags),
             JSON.stringify(turn.choices),
             input.initialTurn.defaultChoiceIndex,
             input.initialTurn.voteDurationMs,
@@ -1185,7 +1211,7 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
 
         const session = await readSession(executor, input.owner, input.sessionId);
         const targetRow = await executor.get(
-          `SELECT id, step_no, ink_checkpoint_json, scene_text, choices_json,
+          `SELECT id, step_no, ink_checkpoint_json, scene_text, scene_tags_json, choices_json,
                   decision_choice_index, default_choice_index, vote_duration_ms
              FROM turn
             WHERE session_id = ? AND step_no = ?`,
@@ -1236,15 +1262,17 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
 
         await executor.run(
           `INSERT INTO turn (
-             id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
+             id, session_id, step_no, ink_checkpoint_json, scene_text, scene_tags_json,
+             choices_json,
              default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
              interactive_message_id, decision_choice_index
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
           replacement.id,
           input.sessionId,
           replacement.stepNumber,
           replacement.inkCheckpoint,
           replacement.sceneText,
+          JSON.stringify(replacement.sceneTags),
           JSON.stringify(replacement.choices),
           defaultChoiceIndex,
           voteDurationMs,

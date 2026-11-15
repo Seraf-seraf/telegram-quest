@@ -1,12 +1,18 @@
 import { InkStoryRuntime } from "./adapters/ink/runtime.js";
 import { createTursoQuestCatalog } from "./adapters/turso/catalog.js";
 import { createTursoDatabase, type TursoDatabase } from "./adapters/turso/client.js";
+import { createTursoMetadataStore } from "./adapters/turso/metadata.js";
 import { ensureSchema } from "./adapters/turso/migrate.js";
 import { ensureDemoCatalog } from "./adapters/turso/seed.js";
 import { createTursoStorySource } from "./adapters/turso/story-source.js";
 import { createTursoSessionStore } from "./adapters/turso/store.js";
 import { loadStorageConfig } from "./config/env.js";
 import type { QuestCatalog } from "./app/quest-catalog.js";
+import {
+  resolveContent as resolveContentFromMetadata,
+  type ContentDiagnosticEvent,
+  type ContentResolver,
+} from "./app/content.js";
 import { SessionService } from "./app/sessions.js";
 import type { StoryRuntime } from "./app/story.js";
 import type { StorySource } from "./app/story-source.js";
@@ -16,6 +22,7 @@ export interface ReadyApp {
   storyRuntime: StoryRuntime;
   sessions: SessionService;
   catalog: QuestCatalog;
+  resolveContent: ContentResolver;
 }
 
 export type BootstrapPhase = "configuration" | "connection" | "schema" | "catalog";
@@ -30,6 +37,7 @@ export interface BootstrapDependencies {
   createDatabase: typeof createTursoDatabase;
   ensureSchema: typeof ensureSchema;
   logFailure: (event: BootstrapFailureEvent) => void;
+  logContentDiagnostic?: (event: ContentDiagnosticEvent) => void;
   storySource?: StorySource;
   ensureDemoCatalog?: typeof ensureDemoCatalog;
 }
@@ -38,6 +46,9 @@ const defaultDependencies: BootstrapDependencies = {
   createDatabase: createTursoDatabase,
   ensureSchema,
   logFailure: (event) => {
+    console.error(JSON.stringify(event));
+  },
+  logContentDiagnostic: (event) => {
     console.error(JSON.stringify(event));
   },
 };
@@ -63,6 +74,7 @@ export async function initializeApp(
     }
 
     const storyRuntime = new InkStoryRuntime();
+    const metadataStore = createTursoMetadataStore(database);
     return {
       database,
       storyRuntime,
@@ -72,6 +84,14 @@ export async function initializeApp(
         storySource,
       }),
       catalog: createTursoQuestCatalog(database),
+      resolveContent: (questId, originalText, references) =>
+        resolveContentFromMetadata(
+          metadataStore,
+          questId,
+          originalText,
+          references,
+          dependencies.logContentDiagnostic ?? defaultDependencies.logContentDiagnostic!,
+        ),
     };
   } catch {
     database?.close();

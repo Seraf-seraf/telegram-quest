@@ -6,7 +6,7 @@ import type { SqlExecutor, SqlParameter, SqlRow, TursoDatabase } from "./client.
 const WRITE_LOCK_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 const INITIAL_SCHEMA_OBJECT_COUNT = 10;
 const SCHEMA_VERSION_TABLE_SQL = "CREATE TABLE quest_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL CHECK (version >= 1))";
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 const DEMO_QUEST_ID = "telegram-quest-demo";
 const DEMO_STORY_REFERENCE = "bundled:telegram-quest-demo-v1";
 
@@ -17,6 +17,10 @@ const versionTwoMigrationUrl = new URL(
 );
 const versionThreeMigrationUrl = new URL(
   "./migrations/003_quest_without_versions.sql",
+  import.meta.url,
+);
+const versionFourMigrationUrl = new URL(
+  "./migrations/004_content_metadata.sql",
   import.meta.url,
 );
 
@@ -181,7 +185,7 @@ async function readUserSchemaObjects(executor: SqlExecutor): Promise<SqlRow[]> {
 }
 
 async function readExpectedSchemaObjects(
-  version: 1 | 2 | 3,
+  version: 1 | 2 | 3 | 4,
 ): Promise<Map<string, string>> {
   const initialSql = normalizeInitialMigration(
     await readFile(versionOneMigrationUrl, "utf8"),
@@ -237,7 +241,7 @@ async function readExpectedSchemaObjects(
     expectedObjects.set(sessionKey, expectedSessionSql);
   }
 
-  if (version === 3) {
+  if (version >= 3) {
     for (const key of [
       "table:quest",
       "table:quest_version",
@@ -270,12 +274,42 @@ async function readExpectedSchemaObjects(
     }
   }
 
+  if (version === 4) {
+    const v4Statements = getSqlStatements(
+      await readFile(versionFourMigrationUrl, "utf8"),
+    );
+    for (const statement of v4Statements) {
+      const alterMatch = /^ALTER\s+TABLE\s+turn\s+ADD\s+COLUMN\s+([\s\S]+)$/i.exec(statement);
+      if (alterMatch?.[1] !== undefined) {
+        const turnSql = expectedObjects.get("table:turn");
+        if (turnSql === undefined) {
+          throw new Error("Content metadata migration does not match the expected turn schema.");
+        }
+        const expectedTurnSql = turnSql.replace(
+          /(interactive_message_id\s+INTEGER\s*,)/i,
+          `$1 ${alterMatch[1].trim()},`,
+        );
+        if (expectedTurnSql === turnSql) {
+          throw new Error("Content metadata migration does not match the expected turn schema.");
+        }
+        expectedObjects.set("table:turn", expectedTurnSql);
+        continue;
+      }
+
+      const objectMatch = /^CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+([A-Za-z_][A-Za-z0-9_]*)\b/i.exec(statement);
+      if (objectMatch === null || objectMatch[2] === undefined) {
+        throw new Error("Content metadata migration contains unsupported schema SQL.");
+      }
+      expectedObjects.set(`${objectMatch[1]!.toLowerCase()}:${objectMatch[2]}`, statement);
+    }
+  }
+
   return expectedObjects;
 }
 
 async function assertSchemaObjects(
   executor: SqlExecutor,
-  version: 1 | 2 | 3,
+  version: 1 | 2 | 3 | 4,
   withVersionTable = false,
 ): Promise<void> {
   const expectedObjects = await readExpectedSchemaObjects(version);
@@ -307,7 +341,7 @@ async function assertSchemaObjects(
     }
   }
 
-  const requiredTables = version === 3
+  const requiredTables: Array<[string, string[]]> = version >= 3
     ? [
       ["session", [
         "id", "quest_id", "owner_type", "owner_id", "status", "ink_state_json",
@@ -322,7 +356,7 @@ async function assertSchemaObjects(
       ]],
       ["vote", ["turn_id", "voter_id", "choice_index", "cast_at_ms"]],
       ["processed_update", ["update_id", "processed_at_ms"]],
-    ] as const
+    ]
     : [
       [
         "session",
@@ -359,13 +393,19 @@ async function assertSchemaObjects(
       ],
       ["vote", ["turn_id", "voter_id", "choice_index", "cast_at_ms"]],
       ["processed_update", ["update_id", "processed_at_ms"]],
-    ] as const;
+    ];
+
+  if (version === 4) {
+    requiredTables.push(["content_metadata", ["id", "quest_id", "name", "kind", "value"]]);
+  }
 
   for (const [table, requiredColumns] of requiredTables) {
     const columnRows = await executor.all(`PRAGMA table_info(${table})`);
     const columns = columnRows.map((row) => row.name);
     const expectedColumns = version === 2 && table === "session"
       ? [...requiredColumns, "final_scene_text", "final_scene_tags_json"]
+      : version === 4 && table === "turn"
+      ? [...requiredColumns, "scene_tags_json"]
       : [...requiredColumns];
 
     if (columns.some((name) => typeof name !== "string") ||
@@ -833,6 +873,28 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function migrateVersionThreeToFour(executor: SqlExecutor): Promise<void> {
+  await executor.exec(await readFile(versionFourMigrationUrl, "utf8"));
+  await assertSchemaObjects(executor, 4, true);
+}
+
+async function advanceStoredVersion(
+  executor: SqlExecutor,
+  fromVersion: number,
+  toVersion: number,
+): Promise<void> {
+  await executor.run(
+    "UPDATE quest_schema_version SET version = ? WHERE id = 1 AND version = ?",
+    toVersion,
+    fromVersion,
+  );
+  const rows = await executor.all("SELECT id, version FROM quest_schema_version");
+  if (rows.length !== 1 || readInteger(rows[0], "id") !== 1 ||
+    readInteger(rows[0], "version") !== toVersion) {
+    throw new Error("Turso schema version could not be advanced to the current version.");
+  }
+}
+
 async function ensureSchemaInTransaction(executor: SqlExecutor): Promise<void> {
   const version = await readSchemaVersion(executor);
 
@@ -846,20 +908,24 @@ async function ensureSchemaInTransaction(executor: SqlExecutor): Promise<void> {
 
   const schemaObjects = await readUserSchemaObjects(executor);
   const hasVersionTable = schemaObjects.some((row) => row.name === "quest_schema_version");
+  let storedVersion: number;
   if (hasVersionTable) {
     const rows = await executor.all("SELECT id, version FROM quest_schema_version");
     if (rows.length !== 1 || readInteger(rows[0], "id") !== 1) {
       throw new Error("Turso schema version table contains an unsupported version.");
     }
-    const storedVersion = readInteger(rows[0], "version");
+    storedVersion = readInteger(rows[0], "version");
     if (storedVersion === CURRENT_SCHEMA_VERSION) {
-      await assertSchemaObjects(executor, 3, true);
+      await assertSchemaObjects(executor, 4, true);
       return;
     }
-    if (storedVersion !== 2) {
+    if (storedVersion === 3) {
+      await assertSchemaObjects(executor, 3, true);
+    } else if (storedVersion === 2) {
+      await assertSchemaObjects(executor, 2, true);
+    } else {
       throw new Error("Turso schema version table contains an unsupported version.");
     }
-    await assertSchemaObjects(executor, 2, true);
   } else {
     if (version === 0) {
       if (schemaObjects.length !== 0) {
@@ -879,19 +945,21 @@ async function ensureSchemaInTransaction(executor: SqlExecutor): Promise<void> {
     await executor.exec(SCHEMA_VERSION_TABLE_SQL);
     await executor.run("INSERT INTO quest_schema_version (id, version) VALUES (1, 2)");
     await assertSchemaObjects(executor, 2, true);
+    storedVersion = 2;
   }
 
-  await migrateVersionTwoToThree(executor);
-  await executor.run(
-    "UPDATE quest_schema_version SET version = ? WHERE id = 1 AND version = 2",
-    CURRENT_SCHEMA_VERSION,
-  );
-  const upgradedRows = await executor.all("SELECT id, version FROM quest_schema_version");
-  if (upgradedRows.length !== 1 || readInteger(upgradedRows[0], "id") !== 1 ||
-    readInteger(upgradedRows[0], "version") !== CURRENT_SCHEMA_VERSION) {
-    throw new Error("Turso schema version could not be advanced to the current version.");
+  if (storedVersion === 2) {
+    await migrateVersionTwoToThree(executor);
+    await advanceStoredVersion(executor, 2, 3);
+    await assertSchemaObjects(executor, 3, true);
+    storedVersion = 3;
   }
-  await assertSchemaObjects(executor, 3, true);
+
+  if (storedVersion === 3) {
+    await migrateVersionThreeToFour(executor);
+    await advanceStoredVersion(executor, 3, 4);
+    await assertSchemaObjects(executor, 4, true);
+  }
 }
 
 export async function ensureSchema(database: TursoDatabase): Promise<void> {

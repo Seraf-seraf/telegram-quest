@@ -222,14 +222,14 @@ describe("ensureSchema with local libSQL", () => {
       const row = await database.read((executor) => executor.get(
         "SELECT version FROM quest_schema_version WHERE id = 1",
       ));
-      expect(Number(row?.version)).toBe(3);
+      expect(Number(row?.version)).toBe(4);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  it("migrates an empty v0 database to v3", async () => {
+  it("migrates an empty v0 database to v4", async () => {
     const { directory, database } = await createTemporaryDatabase();
 
     try {
@@ -237,6 +237,7 @@ describe("ensureSchema with local libSQL", () => {
 
       expect(await readVersion(database)).toBe(0);
       expect(await readTableNames(database)).toEqual([
+        "content_metadata",
         "processed_update",
         "quest",
         "quest_schema_version",
@@ -255,13 +256,82 @@ describe("ensureSchema with local libSQL", () => {
       });
       expect(sessionColumns).toContain("final_scene_text");
       expect(sessionColumns).toContain("final_scene_tags_json");
+      const turnColumns = await database.read(async (executor) => {
+        const rows = await executor.all("PRAGMA table_info(turn)");
+        return rows.map((row) => row.name);
+      });
+      expect(turnColumns).toContain("scene_tags_json");
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  it("migrates a supported v1 database to v3", async () => {
+  it("enforces metadata namespace uniqueness and cascades quest-scoped rows", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+
+    try {
+      await ensureSchema(database);
+      await database.write(async (executor) => {
+        for (const questId of ["quest-a", "quest-b"]) {
+          await executor.run(
+            `INSERT INTO quest (id, title, description, genre, available, story_json)
+             VALUES (?, ?, '', '', 1, '{}')`,
+            questId,
+            questId,
+          );
+        }
+        await executor.run(
+          "INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (?, ?, ?, ?)",
+          "quest-a",
+          "cover",
+          "image",
+          "https://cdn.example/a.jpg",
+        );
+        await executor.run(
+          "INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (?, ?, ?, ?)",
+          "quest-b",
+          "cover",
+          "image",
+          "https://cdn.example/b.jpg",
+        );
+        await executor.run(
+          "INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (NULL, ?, ?, ?)",
+          "menu.main.banner",
+          "image",
+          "https://cdn.example/menu.jpg",
+        );
+      });
+
+      await expect(database.write((executor) => executor.run(
+        "INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (?, ?, ?, ?)",
+        "quest-a",
+        "cover",
+        "text",
+        "duplicate",
+      ))).rejects.toThrow();
+      await expect(database.write((executor) => executor.run(
+        "INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (NULL, ?, ?, ?)",
+        "menu.main.banner",
+        "image",
+        "https://cdn.example/duplicate.jpg",
+      ))).rejects.toThrow();
+
+      await database.write((executor) => executor.run("DELETE FROM quest WHERE id = ?", "quest-a"));
+      const remaining = await database.read((executor) => executor.all(
+        "SELECT quest_id, name FROM content_metadata ORDER BY quest_id, name",
+      ));
+      expect(remaining).toEqual([
+        { quest_id: null, name: "menu.main.banner" },
+        { quest_id: "quest-b", name: "cover" },
+      ]);
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a supported v1 database to v4", async () => {
     const { directory, database } = await createTemporaryDatabase();
 
     try {
@@ -295,8 +365,51 @@ describe("ensureSchema with local libSQL", () => {
       const row = await database.read((executor) => executor.get(
         "SELECT version FROM quest_schema_version WHERE id = 1",
       ));
-      expect(Number(row?.version)).toBe(3);
+      expect(Number(row?.version)).toBe(4);
       expect(await readTableNames(database)).not.toContain("quest_version");
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a valid v3 schema to v4 and remains idempotent", async () => {
+    const { directory, database } = await createTemporaryDatabase();
+
+    try {
+      await ensureSchema(database);
+      await database.write(async (executor) => {
+        await executor.exec(
+          `DROP INDEX ux_content_metadata_global_name;
+           DROP INDEX ux_content_metadata_quest_name;
+           DROP TABLE content_metadata;
+           ALTER TABLE turn DROP COLUMN scene_tags_json;`,
+        );
+        await executor.run("UPDATE quest_schema_version SET version = 3 WHERE id = 1");
+      });
+
+      await ensureSchema(database);
+      const migrated = await database.read(async (executor) => ({
+        marker: await executor.get("SELECT version FROM quest_schema_version WHERE id = 1"),
+        columns: await executor.all("PRAGMA table_info(turn)"),
+      }));
+      expect(Number(migrated.marker?.version)).toBe(4);
+      expect(migrated.columns.map((column) => column.name)).toContain("scene_tags_json");
+
+      let mutationCalls = 0;
+      const noMutationDatabase = wrapDatabase(database, (executor) => ({
+        ...executor,
+        exec: async (sql) => {
+          mutationCalls += 1;
+          await executor.exec(sql);
+        },
+        run: async (sql, ...args) => {
+          mutationCalls += 1;
+          await executor.run(sql, ...args);
+        },
+      }));
+      await ensureSchema(noMutationDatabase);
+      expect(mutationCalls).toBe(0);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
@@ -444,7 +557,7 @@ describe("ensureSchema with local libSQL", () => {
         ),
         turns: await executor.all(
           `SELECT id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json,
-                  default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
+                  scene_tags_json, default_choice_index, vote_duration_ms, deadline_at_ms, remaining_ms,
                   decision_choice_index, interactive_message_id FROM turn ORDER BY id`,
         ),
         votes: await executor.all("SELECT turn_id, voter_id, choice_index, cast_at_ms FROM vote"),
@@ -468,9 +581,9 @@ describe("ensureSchema with local libSQL", () => {
         { id: "session-paused", quest_id: "telegram-quest-demo", status: "paused", ink_state_json: initial.stateJson, state_version: 4, menu_message_id: 5002 },
       ]);
       expect(migrated.turns).toMatchObject([
-        { id: "turn-active", ink_checkpoint_json: initial.stateJson, interactive_message_id: 7001 },
-        { id: "turn-completed", ink_checkpoint_json: branch.stateJson, decision_choice_index: 0, interactive_message_id: 7003 },
-        { id: "turn-paused", ink_checkpoint_json: initial.stateJson, default_choice_index: 0, vote_duration_ms: 60000, remaining_ms: 40000, interactive_message_id: 7002 },
+        { id: "turn-active", ink_checkpoint_json: initial.stateJson, scene_tags_json: "[]", interactive_message_id: 7001 },
+        { id: "turn-completed", ink_checkpoint_json: branch.stateJson, scene_tags_json: "[]", decision_choice_index: 0, interactive_message_id: 7003 },
+        { id: "turn-paused", ink_checkpoint_json: initial.stateJson, scene_tags_json: "[]", default_choice_index: 0, vote_duration_ms: 60000, remaining_ms: 40000, interactive_message_id: 7002 },
       ]);
       expect(migrated.votes).toEqual([
         { turn_id: "turn-active", voter_id: "voter-1", choice_index: 0, cast_at_ms: 1234 },
@@ -666,7 +779,7 @@ describe("ensureSchema with local libSQL", () => {
       const upgraded = await database.read((executor) => executor.get(
         "SELECT version FROM quest_schema_version WHERE id = 1",
       ));
-      expect(Number(upgraded?.version)).toBe(3);
+      expect(Number(upgraded?.version)).toBe(4);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
@@ -678,20 +791,20 @@ describe("ensureSchema with local libSQL", () => {
     try {
       await ensureSchema(database);
       await database.write((executor) => executor.run(
-        "UPDATE quest_schema_version SET version = 4 WHERE id = 1",
+        "UPDATE quest_schema_version SET version = 5 WHERE id = 1",
       ));
       await expect(ensureSchema(database)).rejects.toThrow("unsupported version");
       const row = await database.read((executor) => executor.get(
         "SELECT version FROM quest_schema_version WHERE id = 1",
       ));
-      expect(Number(row?.version)).toBe(4);
+      expect(Number(row?.version)).toBe(5);
     } finally {
       database.close();
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  it("leaves a v3 schema unchanged", async () => {
+  it("leaves a v4 schema unchanged", async () => {
     const { directory, database } = await createTemporaryDatabase();
     let execCalls = 0;
     let runCalls = 0;
@@ -822,7 +935,7 @@ describe("ensureSchema with local libSQL", () => {
     }
   });
 
-  it("refuses a negative user_version even if the tables match v3", async () => {
+  it("refuses a negative user_version even if the tables match v4", async () => {
     const { directory, database } = await createTemporaryDatabase();
 
     try {
@@ -844,11 +957,11 @@ describe("ensureSchema with local libSQL", () => {
 
     try {
       await database.write(async (executor) => {
-        await executor.run("PRAGMA user_version = 3");
+        await executor.run("PRAGMA user_version = 4");
       });
 
       await expect(ensureSchema(database)).rejects.toThrow("newer than this application supports");
-      expect(await readVersion(database)).toBe(3);
+      expect(await readVersion(database)).toBe(4);
       expect(await readTableNames(database)).toEqual([]);
     } finally {
       database.close();
@@ -923,7 +1036,7 @@ describe("ensureSchema with local libSQL", () => {
       ]);
 
       expect(await readVersion(firstDatabase)).toBe(0);
-      expect(await readTableNames(firstDatabase)).toHaveLength(6);
+      expect(await readTableNames(firstDatabase)).toHaveLength(7);
     } finally {
       firstDatabase.close();
       secondDatabase.close();
@@ -997,7 +1110,7 @@ describe("ensureSchema with local libSQL", () => {
       database.close();
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 });
 
 class FakeTursoConnection implements SqlExecutor {

@@ -30,6 +30,7 @@ export interface Turn {
   stepNumber: number;
   inkCheckpoint: InkState;
   sceneText: string;
+  sceneTags: string[];
   choices: Choice[];
   decision: Decision | null;
 }

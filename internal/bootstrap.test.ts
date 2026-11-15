@@ -32,6 +32,7 @@ function dependencies(
     ensureSchema: async () => undefined,
     ensureDemoCatalog: async () => undefined,
     logFailure: () => undefined,
+    logContentDiagnostic: () => undefined,
     ...overrides,
   };
 }
@@ -67,6 +68,7 @@ describe("initializeApp", () => {
     expect(result.storyRuntime).toBeDefined();
     expect(result.sessions).toBeInstanceOf(SessionService);
     expect(result.catalog.listAvailableQuests).toBeTypeOf("function");
+    expect(result.resolveContent).toBeTypeOf("function");
     expect(database.closed).toBe(false);
   });
 

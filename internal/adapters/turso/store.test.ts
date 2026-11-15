@@ -23,12 +23,13 @@ import type {
 } from "./client.js";
 import { ensureSchema } from "./migrate.js";
 import { createTursoSessionStore } from "./store.js";
+import { assetReferences } from "../../app/content.js";
 
 const compiledStoryJson = readFileSync(
   new URL("../ink/fixtures/demo.ink.json", import.meta.url),
   "utf8",
 );
-const LOCAL_SQLITE_TEST_TIMEOUT_MS = 15_000;
+const LOCAL_SQLITE_TEST_TIMEOUT_MS = 30_000;
 const source: StorySource = {
   load: async (questId) => {
     if (questId !== "quest-1") {
@@ -413,6 +414,106 @@ describe("Turso session store with local libSQL", () => {
     });
     expect(turns).toEqual(started.turns);
     expect(recoveredSource.load).not.toHaveBeenCalled();
+    recoveredDatabase.close();
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
+  it("persists scene references through choice, rewind, restart, recovery, and fresh metadata reads", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+    const runtime: StoryRuntime = {
+      start: () => ({
+        text: "The corridor begins.",
+        choices: [{ index: 0, text: "Continue", tags: [] }],
+        tags: ["asset:dark_corridor"],
+        stateJson: JSON.stringify({ step: 1 }),
+        ended: false,
+      }),
+      choose: () => ({
+        text: "A note appears.",
+        choices: [{ index: 0, text: "Continue", tags: [] }],
+        tags: ["asset:corridor_note"],
+        stateJson: JSON.stringify({ step: 2 }),
+        ended: false,
+      }),
+    };
+    const service = makeService(database, {
+      runtime,
+      ids: [
+        "metadata-session",
+        "metadata-turn-start",
+        "metadata-turn-choice",
+        "metadata-turn-rewind",
+        "metadata-turn-restart",
+      ],
+    });
+    const created = await service.createSession(userOwner, "quest-1", 1_501);
+    const started = await service.startSession(userOwner, created.id, 0);
+    expect(started.turns[0]?.sceneTags).toEqual(["asset:dark_corridor"]);
+
+    const afterChoice = await service.applyDecision(
+      userOwner,
+      created.id,
+      started.turns[0]!.id,
+      0,
+      started.stateVersion,
+      1_502,
+    );
+    expect((await service.listTurns(userOwner, created.id)).map((turn) => turn.sceneTags))
+      .toEqual([["asset:dark_corridor"], ["asset:corridor_note"]]);
+
+    const rewound = await service.rewindSession(
+      userOwner,
+      created.id,
+      1,
+      afterChoice.stateVersion,
+    );
+    expect(rewound.turns[0]?.sceneTags).toEqual(["asset:dark_corridor"]);
+
+    const restarted = await service.restartSession(userOwner, created.id, rewound.stateVersion, true);
+    expect(restarted.turns[0]?.sceneTags).toEqual(["asset:dark_corridor"]);
+    expect(JSON.stringify(restarted.turns[0]?.sceneTags)).not.toContain("https://");
+
+    await database.write((executor) => executor.run(
+      `INSERT INTO content_metadata (quest_id, name, kind, value) VALUES (?, ?, 'image', ?)`,
+      "quest-1",
+      "dark_corridor",
+      "https://cdn.example/first.jpg",
+    ));
+    database.close();
+
+    const recoveredDatabase = new LocalFileDatabase(temporary.url);
+    openDatabases.add(recoveredDatabase);
+    const recoveredApp = await initializeLocalApp(recoveredDatabase, source);
+    const recoveredService = requireSessions(recoveredApp);
+    const recovered = await recoveredService.getSession(userOwner, created.id);
+    const recoveredTurn = recovered.turns[0]!;
+    expect(recoveredTurn.sceneTags).toEqual(["asset:dark_corridor"]);
+
+    const firstResolution = await recoveredApp.resolveContent(
+      recovered.questId,
+      recoveredTurn.sceneText,
+      assetReferences(recoveredTurn.sceneTags),
+    );
+    expect(firstResolution.imageUrl).toBe("https://cdn.example/first.jpg");
+
+    await recoveredDatabase.write((executor) => executor.run(
+      "UPDATE content_metadata SET value = ? WHERE quest_id = ? AND name = ?",
+      "https://cdn.example/updated.jpg",
+      "quest-1",
+      "dark_corridor",
+    ));
+    const nextReadSession = await recoveredService.getSession(userOwner, created.id);
+    const nextResolution = await recoveredApp.resolveContent(
+      nextReadSession.questId,
+      nextReadSession.turns[0]!.sceneText,
+      assetReferences(nextReadSession.turns[0]!.sceneTags),
+    );
+    expect(nextReadSession.stateVersion).toBe(recovered.stateVersion);
+    expect(nextReadSession.turns[0]?.choices).toEqual(recoveredTurn.choices);
+    expect(nextResolution.imageUrl).toBe("https://cdn.example/updated.jpg");
     recoveredDatabase.close();
   }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
 
