@@ -16,6 +16,7 @@ const validEnv = {
   TURSO_AUTH_TOKEN: "test-token",
 };
 const privateUserId = 41;
+const FILE_DATABASE_FLOW_TIMEOUT_MS = 15_000;
 const openDatabases = new Set<TursoDatabase>();
 const temporaryDirectories: string[] = [];
 
@@ -730,5 +731,254 @@ describe("private quest Telegram handlers", () => {
       phase: "scene",
       code: "INTERNAL_ERROR",
     });
+  }, FILE_DATABASE_FLOW_TIMEOUT_MS);
+
+  it("confirms lifecycle actions, lists turns, and rejects stale or foreign controls", async () => {
+    const database = createMemoryDatabase();
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+    });
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    const failures: Array<{ event: string; phase: string; code: string }> = [];
+    const getApplication = vi.fn(async () => app);
+    registerPrivateQuestHandlers(bot, getApplication, (event) => failures.push(event));
+    const pauseSession = vi.spyOn(app.sessions, "pauseSession");
+    const resumeSession = vi.spyOn(app.sessions, "resumeSession");
+    const stopSession = vi.spyOn(app.sessions, "stopSession");
+    const restartSession = vi.spyOn(app.sessions, "restartSession");
+    const rewindSession = vi.spyOn(app.sessions, "rewindSession");
+    const applyDecision = vi.spyOn(app.sessions, "applyDecision");
+    const storyStart = vi.spyOn(app.storyRuntime, "start");
+    const storyChoose = vi.spyOn(app.storyRuntime, "choose");
+    let updateId = 200;
+
+    await bot.handleUpdate(commandUpdate(190, privateUserId, "/quests"));
+    const panelMessageId = latestMessageId(telegram.calls);
+
+    async function clickPanel(text: string, userId: number = privateUserId): Promise<string> {
+      const data = buttonDataForMessage(telegram.calls, panelMessageId, text);
+      await bot.handleUpdate(callbackUpdate(updateId++, userId, panelMessageId, data));
+      return data;
+    }
+
+    async function clickCallback(
+      messageId: number,
+      data: string,
+      userId: number = privateUserId,
+    ): Promise<void> {
+      await bot.handleUpdate(callbackUpdate(updateId++, userId, messageId, data));
+    }
+
+    await clickPanel("Две двери");
+    await clickPanel("Версия 1.0.0");
+    await clickPanel("Начать");
+    expect(storyStart).toHaveBeenCalledTimes(1);
+
+    const session = (await app.sessions.listOwnedSessions(
+      { type: "user", id: String(privateUserId) },
+      20,
+      null,
+    )).sessions[0];
+    if (session === undefined) {
+      throw new Error("The test quest session was not created.");
+    }
+    const initialSession = await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    );
+    const initialTurnId = initialSession.turns[0]?.id;
+    const initialSceneMessageId = latestMessageId(telegram.calls);
+    const initialChoice = buttonDataForMessage(
+      telegram.calls,
+      initialSceneMessageId,
+      "Take the left path",
+    );
+    const originalManage = buttonDataForMessage(telegram.calls, panelMessageId, "Управление");
+
+    await clickCallback(
+      panelMessageId,
+      encodePrivateQuestCallback({
+        kind: "pause",
+        sessionId: session.id,
+        stateVersion: 1,
+      }),
+      84,
+    );
+    expect(pauseSession).not.toHaveBeenCalled();
+    expect(telegram.calls.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text)
+      .toBe("Прохождение изменилось. Откройте /sessions и выберите его снова.");
+    expect(failures).toContainEqual({
+      event: "telegram_quest.private_handler_failed",
+      phase: "session_lifecycle",
+      code: "FORBIDDEN_OWNER",
+    });
+
+    await clickCallback(initialSceneMessageId, initialChoice);
+    expect(applyDecision).toHaveBeenCalledTimes(1);
+    expect(storyChoose).toHaveBeenCalledTimes(1);
+    expect((await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).stateVersion).toBe(2);
+
+    await clickCallback(panelMessageId, originalManage);
+    expect(buttonDataForMessage(telegram.calls, panelMessageId, "Пауза")).toBe(
+      encodePrivateQuestCallback({ kind: "pause", sessionId: session.id, stateVersion: 2 }),
+    );
+    await clickPanel("Пауза");
+    expect(pauseSession).toHaveBeenCalledWith(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+      2,
+    );
+    expect(await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).toMatchObject({ status: "paused", stateVersion: 3 });
+
+    await clickCallback(initialSceneMessageId, initialChoice);
+    expect(applyDecision).toHaveBeenCalledTimes(1);
+    expect(telegram.calls.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text)
+      .toBe("Ход изменился. Откройте /sessions, чтобы увидеть продолжение.");
+
+    await clickPanel("Управление");
+    await clickPanel("Продолжить игру");
+    expect(resumeSession).toHaveBeenCalledWith(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+      3,
+    );
+    expect(await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).toMatchObject({ status: "active", stateVersion: 4 });
+
+    await clickPanel("Управление");
+    await clickPanel("История ходов");
+    expect(latestScreen(telegram.calls).payload.text).toContain("Ход 1: A sign points toward two doors.");
+    expect(latestScreen(telegram.calls).payload.text).toContain("Ход 2: The left path glows.");
+    const firstTurnButton = "Ход 1: A sign points toward two doors.";
+    await clickPanel(firstTurnButton);
+    expect(latestScreen(telegram.calls).payload.text)
+      .toContain("Откатиться к ходу 1: A sign points toward two doors.");
+    await clickPanel("Отмена");
+    expect(rewindSession).not.toHaveBeenCalled();
+    expect(await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).toMatchObject({ status: "active", stateVersion: 4 });
+
+    await clickPanel("История ходов");
+    await clickPanel(firstTurnButton);
+    await clickPanel("Подтвердить откат");
+    expect(rewindSession).toHaveBeenCalledWith(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+      1,
+      4,
+    );
+    expect(storyStart).toHaveBeenCalledTimes(1);
+    expect(storyChoose).toHaveBeenCalledTimes(1);
+    const rewound = await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    );
+    expect(rewound).toMatchObject({ status: "active", stateVersion: 5 });
+    expect(rewound.turns).toHaveLength(1);
+    expect(rewound.turns[0]?.stepNumber).toBe(1);
+    expect(rewound.turns[0]?.id).not.toBe(initialTurnId);
+    expect(rewindSession).toHaveBeenCalledTimes(1);
+
+    await clickCallback(initialSceneMessageId, initialChoice);
+    expect(applyDecision).toHaveBeenCalledTimes(1);
+    const currentSceneMessageId = latestMessageId(telegram.calls);
+    const currentChoice = buttonDataForMessage(
+      telegram.calls,
+      currentSceneMessageId,
+      "Take the left path",
+    );
+    const staleManage = buttonDataForMessage(telegram.calls, panelMessageId, "Управление");
+    await clickCallback(currentSceneMessageId, currentChoice);
+    expect(storyChoose).toHaveBeenCalledTimes(2);
+    expect((await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).stateVersion).toBe(6);
+
+    await clickCallback(panelMessageId, staleManage);
+    expect(buttonDataForMessage(telegram.calls, panelMessageId, "Пауза")).toBe(
+      encodePrivateQuestCallback({ kind: "pause", sessionId: session.id, stateVersion: 6 }),
+    );
+    await clickPanel("Начать заново");
+    expect(latestScreen(telegram.calls).payload.text)
+      .toContain("Текущие ходы и выборы будут удалены.");
+    await clickPanel("Отмена");
+    expect(restartSession).not.toHaveBeenCalled();
+    expect((await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).stateVersion).toBe(6);
+
+    await clickPanel("Начать заново");
+    await clickPanel("Подтвердить перезапуск");
+    expect(restartSession).toHaveBeenCalledWith(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+      6,
+      true,
+    );
+    expect(storyStart).toHaveBeenCalledTimes(2);
+    expect(storyChoose).toHaveBeenCalledTimes(2);
+    const restarted = await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    );
+    expect(restarted).toMatchObject({ status: "active", stateVersion: 7 });
+    expect(restarted.turns).toHaveLength(1);
+    expect(restarted.turns[0]?.stepNumber).toBe(1);
+    expect(restarted.turns[0]?.id).not.toBe(rewound.turns[0]?.id);
+    expect(restartSession).toHaveBeenCalledTimes(1);
+
+    await clickPanel("Управление");
+    await clickPanel("Остановить");
+    await clickPanel("Отмена");
+    expect(stopSession).not.toHaveBeenCalled();
+    expect((await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    )).stateVersion).toBe(7);
+
+    await clickPanel("Остановить");
+    await clickPanel("Подтвердить остановку");
+    expect(stopSession).toHaveBeenCalledWith(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+      7,
+    );
+    const stopped = await app.sessions.getSession(
+      { type: "user", id: String(privateUserId) },
+      session.id,
+    );
+    expect(stopped).toMatchObject({
+      status: "completed",
+      stateVersion: 8,
+      outcome: "stopped_by_owner",
+      finalScene: null,
+    });
+    expect(stopSession).toHaveBeenCalledTimes(1);
+
+    await clickCallback(panelMessageId, encodePrivateQuestCallback({
+      kind: "rewind_confirm",
+      sessionId: session.id,
+      stateVersion: stopped.stateVersion,
+      targetStepNo: 1,
+      confirmed: true,
+    }));
+    expect(rewindSession).toHaveBeenCalledTimes(1);
+    expect(telegram.calls.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text)
+      .toBe("Прохождение изменилось. Откройте /sessions и выберите его снова.");
   });
 });

@@ -24,6 +24,23 @@ describe("private quest callback protocol", () => {
         stateVersion: 123,
         choiceIndex: 11,
       },
+      { kind: "manage", sessionId: "session-1", stateVersion: 12 },
+      { kind: "pause", sessionId: "session-1", stateVersion: 12 },
+      { kind: "resume", sessionId: "session-1", stateVersion: 12 },
+      { kind: "stop_prompt", sessionId: "session-1", stateVersion: 12 },
+      { kind: "stop_confirm", sessionId: "session-1", stateVersion: 12, confirmed: true },
+      { kind: "stop_confirm", sessionId: "session-1", stateVersion: 12, confirmed: false },
+      { kind: "restart_prompt", sessionId: "session-1", stateVersion: 12 },
+      { kind: "restart_confirm", sessionId: "session-1", stateVersion: 12, confirmed: true },
+      { kind: "rewind_list", sessionId: "session-1", stateVersion: 12 },
+      { kind: "rewind_prompt", sessionId: "session-1", stateVersion: 12, targetStepNo: 3 },
+      {
+        kind: "rewind_confirm",
+        sessionId: "session-1",
+        stateVersion: 12,
+        targetStepNo: 3,
+        confirmed: false,
+      },
     ];
 
     for (const callback of callbacks) {
@@ -45,6 +62,12 @@ describe("private quest callback protocol", () => {
       choiceIndex: 0,
     })).toThrow(CallbackDataError);
     expect(() => encodePrivateQuestCallback({
+      kind: "rewind_prompt",
+      sessionId: "session-1",
+      stateVersion: 0,
+      targetStepNo: 0,
+    })).toThrow(CallbackDataError);
+    expect(() => encodePrivateQuestCallback({
       kind: "choice",
       sessionId: "session-a",
       stateVersion: -1,
@@ -61,6 +84,11 @@ describe("private quest callback protocol", () => {
       "v1:c:YQ:00:0",
       "v1:c:YQ:zzzzzzzzzzzz:0",
       "v1:c:YQ:1",
+      "v1:p:YQ:00",
+      "v1:T:YQ:1:yes",
+      "v1:w:YQ:1:0",
+      "v1:W:YQ:1:0:1",
+      "v1:W:YQ:1:2:x",
       "v1:unknown",
       `v1:q:${"a".repeat(80)}`,
     ];

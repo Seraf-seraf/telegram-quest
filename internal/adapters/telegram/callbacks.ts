@@ -17,6 +17,22 @@ export type PrivateQuestCallback =
     sessionId: string;
     stateVersion: number;
     choiceIndex: number;
+  }
+  | { kind: "manage"; sessionId: string; stateVersion: number }
+  | { kind: "pause"; sessionId: string; stateVersion: number }
+  | { kind: "resume"; sessionId: string; stateVersion: number }
+  | { kind: "stop_prompt"; sessionId: string; stateVersion: number }
+  | { kind: "stop_confirm"; sessionId: string; stateVersion: number; confirmed: boolean }
+  | { kind: "restart_prompt"; sessionId: string; stateVersion: number }
+  | { kind: "restart_confirm"; sessionId: string; stateVersion: number; confirmed: boolean }
+  | { kind: "rewind_list"; sessionId: string; stateVersion: number }
+  | { kind: "rewind_prompt"; sessionId: string; stateVersion: number; targetStepNo: number }
+  | {
+    kind: "rewind_confirm";
+    sessionId: string;
+    stateVersion: number;
+    targetStepNo: number;
+    confirmed: boolean;
   };
 
 export class CallbackDataError extends Error {
@@ -66,6 +82,13 @@ function encodeIndex(index: number): string {
   return index.toString(36);
 }
 
+function encodePositiveIndex(index: number): string {
+  if (!Number.isSafeInteger(index) || index < 1) {
+    throw new CallbackDataError();
+  }
+  return index.toString(36);
+}
+
 function decodeIndex(token: string | undefined): number | null {
   if (token === undefined || !/^(0|[1-9a-z][0-9a-z]*)$/.test(token)) {
     return null;
@@ -73,6 +96,20 @@ function decodeIndex(token: string | undefined): number | null {
 
   const index = Number.parseInt(token, 36);
   return Number.isSafeInteger(index) && index.toString(36) === token ? index : null;
+}
+
+function encodeBoolean(value: boolean): string {
+  return value ? "1" : "0";
+}
+
+function decodeBoolean(token: string | undefined): boolean | null {
+  if (token === "1") {
+    return true;
+  }
+  if (token === "0") {
+    return false;
+  }
+  return null;
 }
 
 function assertCallbackLength(data: string): string {
@@ -112,6 +149,36 @@ export function encodePrivateQuestCallback(callback: PrivateQuestCallback): stri
       break;
     case "choice":
       data = `${CALLBACK_PROTOCOL_VERSION}:c:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodeIndex(callback.choiceIndex)}`;
+      break;
+    case "manage":
+      data = `${CALLBACK_PROTOCOL_VERSION}:a:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "pause":
+      data = `${CALLBACK_PROTOCOL_VERSION}:p:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "resume":
+      data = `${CALLBACK_PROTOCOL_VERSION}:u:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "stop_prompt":
+      data = `${CALLBACK_PROTOCOL_VERSION}:t:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "stop_confirm":
+      data = `${CALLBACK_PROTOCOL_VERSION}:T:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodeBoolean(callback.confirmed)}`;
+      break;
+    case "restart_prompt":
+      data = `${CALLBACK_PROTOCOL_VERSION}:r:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "restart_confirm":
+      data = `${CALLBACK_PROTOCOL_VERSION}:R:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodeBoolean(callback.confirmed)}`;
+      break;
+    case "rewind_list":
+      data = `${CALLBACK_PROTOCOL_VERSION}:h:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}`;
+      break;
+    case "rewind_prompt":
+      data = `${CALLBACK_PROTOCOL_VERSION}:w:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodePositiveIndex(callback.targetStepNo)}`;
+      break;
+    case "rewind_confirm":
+      data = `${CALLBACK_PROTOCOL_VERSION}:W:${encodeId(callback.sessionId)}:${encodeIndex(callback.stateVersion)}:${encodePositiveIndex(callback.targetStepNo)}:${encodeBoolean(callback.confirmed)}`;
       break;
     default: {
       const exhaustive: never = callback;
@@ -188,6 +255,74 @@ export function parsePrivateQuestCallback(data: unknown): PrivateQuestCallback |
       return sessionId === null || stateVersion === null || choiceIndex === null
         ? null
         : { kind: "choice", sessionId, stateVersion, choiceIndex };
+    }
+    case "a":
+    case "p":
+    case "u":
+    case "t":
+    case "r":
+    case "h": {
+      if (parts.length !== 4) {
+        return null;
+      }
+      const sessionId = decodeId(parts[2]);
+      const stateVersion = decodeIndex(parts[3]);
+      if (sessionId === null || stateVersion === null) {
+        return null;
+      }
+      switch (operation) {
+        case "a":
+          return { kind: "manage", sessionId, stateVersion };
+        case "p":
+          return { kind: "pause", sessionId, stateVersion };
+        case "u":
+          return { kind: "resume", sessionId, stateVersion };
+        case "t":
+          return { kind: "stop_prompt", sessionId, stateVersion };
+        case "r":
+          return { kind: "restart_prompt", sessionId, stateVersion };
+        case "h":
+          return { kind: "rewind_list", sessionId, stateVersion };
+      }
+      return null;
+    }
+    case "T":
+    case "R": {
+      if (parts.length !== 5) {
+        return null;
+      }
+      const sessionId = decodeId(parts[2]);
+      const stateVersion = decodeIndex(parts[3]);
+      const confirmed = decodeBoolean(parts[4]);
+      if (sessionId === null || stateVersion === null || confirmed === null) {
+        return null;
+      }
+      return operation === "T"
+        ? { kind: "stop_confirm", sessionId, stateVersion, confirmed }
+        : { kind: "restart_confirm", sessionId, stateVersion, confirmed };
+    }
+    case "w": {
+      if (parts.length !== 5) {
+        return null;
+      }
+      const sessionId = decodeId(parts[2]);
+      const stateVersion = decodeIndex(parts[3]);
+      const targetStepNo = decodeIndex(parts[4]);
+      return sessionId === null || stateVersion === null || targetStepNo === null || targetStepNo < 1
+        ? null
+        : { kind: "rewind_prompt", sessionId, stateVersion, targetStepNo };
+    }
+    case "W": {
+      if (parts.length !== 6) {
+        return null;
+      }
+      const sessionId = decodeId(parts[2]);
+      const stateVersion = decodeIndex(parts[3]);
+      const targetStepNo = decodeIndex(parts[4]);
+      const confirmed = decodeBoolean(parts[5]);
+      return sessionId === null || stateVersion === null || targetStepNo === null || targetStepNo < 1 || confirmed === null
+        ? null
+        : { kind: "rewind_confirm", sessionId, stateVersion, targetStepNo, confirmed };
     }
     default:
       return null;

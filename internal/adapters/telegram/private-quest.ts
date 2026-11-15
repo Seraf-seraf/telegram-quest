@@ -18,16 +18,36 @@ export interface PrivateQuestApplication {
   sessions: Pick<
     SessionService,
     "applyDecision" | "createSession" | "getSession" | "listOwnedSessions" | "startSession"
+      | "listTurns" | "pauseSession" | "resumeSession" | "stopSession"
+      | "restartSession" | "rewindSession"
   >;
 }
 
 type GetPrivateQuestApplication = () => Promise<PrivateQuestApplication>;
+type SessionControlCallback = Extract<
+  PrivateQuestCallback,
+  {
+    kind:
+      | "manage"
+      | "pause"
+      | "resume"
+      | "stop_prompt"
+      | "stop_confirm"
+      | "restart_prompt"
+      | "restart_confirm"
+      | "rewind_list"
+      | "rewind_prompt"
+      | "rewind_confirm";
+  }
+>;
 type FailurePhase =
   | "catalog"
   | "sessions"
   | "session_create"
   | "session_open"
   | "session_decision"
+  | "session_lifecycle"
+  | "session_history"
   | "scene";
 
 interface PrivateQuestFailureEvent {
@@ -86,8 +106,13 @@ function mainMenuKeyboard(): InlineKeyboard {
   return keyboard;
 }
 
-function sessionMenuKeyboard(): InlineKeyboard {
+function sessionMenuKeyboard(session: Session): InlineKeyboard {
   const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Управление", {
+    kind: "manage",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+  });
   addButton(keyboard, "Мои прохождения", { kind: "sessions" });
   addButton(keyboard, "В меню", { kind: "menu" });
   return keyboard;
@@ -357,12 +382,170 @@ async function showSession(
   const quest = version === null ? undefined : quests.find((item) => item.id === version.questId);
   const title = quest?.title ?? "Квест";
   const versionText = version === null ? "" : ` · версия ${version.version}`;
+  const sessionMessage = session.status === "paused"
+    ? "Прохождение на паузе."
+    : session.status === "completed"
+      ? session.outcome === "stopped_by_owner"
+        ? "Прохождение остановлено."
+        : "Квест завершён."
+      : "Продолжение загружено из сохранённого прохождения.";
   await showScreen(
     context,
-    `${title}${versionText}\nСтатус: ${statusLabel(session.status)}\n\nПродолжение загружено из сохранённого прохождения.`,
-    sessionMenuKeyboard(),
+    `${title}${versionText}\nСтатус: ${statusLabel(session.status)}\n\n${sessionMessage}`,
+    sessionMenuKeyboard(session),
   );
   await sendSessionOutput(context, session, updateId);
+}
+
+function sessionControlsKeyboard(session: Session): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Показать сцену", { kind: "session", sessionId: session.id });
+
+  if (session.status === "active") {
+    addButton(keyboard, "Пауза", {
+      kind: "pause",
+      sessionId: session.id,
+      stateVersion: session.stateVersion,
+    });
+  } else if (session.status === "paused") {
+    addButton(keyboard, "Продолжить игру", {
+      kind: "resume",
+      sessionId: session.id,
+      stateVersion: session.stateVersion,
+    });
+  }
+
+  if (session.status !== "completed") {
+    addButton(keyboard, "Остановить", {
+      kind: "stop_prompt",
+      sessionId: session.id,
+      stateVersion: session.stateVersion,
+    });
+  }
+  addButton(keyboard, "Начать заново", {
+    kind: "restart_prompt",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+  });
+  addButton(keyboard, "История ходов", {
+    kind: "rewind_list",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+  });
+  addButton(keyboard, "К прохождениям", { kind: "sessions" });
+  return keyboard;
+}
+
+function historyDescription(sceneText: string): string {
+  const normalizedText = sceneText.replace(/\s+/gu, " ").trim();
+  return normalizedText.length === 0 ? "Пустая сцена" : buttonText(normalizedText);
+}
+
+async function showSessionControls(context: Context, session: Session): Promise<void> {
+  await showScreen(
+    context,
+    `Управление прохождением\nСтатус: ${statusLabel(session.status)}`,
+    sessionControlsKeyboard(session),
+  );
+}
+
+async function showStopConfirmation(context: Context, session: Session): Promise<void> {
+  const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Подтвердить остановку", {
+    kind: "stop_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    confirmed: true,
+  });
+  addButton(keyboard, "Отмена", {
+    kind: "stop_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    confirmed: false,
+  });
+  await showScreen(context, "Остановить прохождение? Оно завершится без финала.", keyboard);
+}
+
+async function showRestartConfirmation(context: Context, session: Session): Promise<void> {
+  const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Подтвердить перезапуск", {
+    kind: "restart_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    confirmed: true,
+  });
+  addButton(keyboard, "Отмена", {
+    kind: "restart_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    confirmed: false,
+  });
+  await showScreen(
+    context,
+    "Начать прохождение заново? Текущие ходы и выборы будут удалены.",
+    keyboard,
+  );
+}
+
+async function showRewindConfirmation(
+  context: Context,
+  session: Session,
+  targetStepNo: number,
+  targetScene: string,
+): Promise<void> {
+  const keyboard = new InlineKeyboard();
+  addButton(keyboard, "Подтвердить откат", {
+    kind: "rewind_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    targetStepNo,
+    confirmed: true,
+  });
+  addButton(keyboard, "Отмена", {
+    kind: "rewind_confirm",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+    targetStepNo,
+    confirmed: false,
+  });
+  await showScreen(
+    context,
+    `Откатиться к ходу ${targetStepNo}: ${historyDescription(targetScene)}? Более поздние ходы будут удалены.`,
+    keyboard,
+  );
+}
+
+async function showSessionHistory(
+  context: Context,
+  session: Session,
+  turns: Awaited<ReturnType<SessionService["listTurns"]>>,
+): Promise<void> {
+  const keyboard = new InlineKeyboard();
+  const canRewind = session.status === "active" || session.status === "paused";
+  for (const turn of turns) {
+    if (canRewind) {
+      addButton(keyboard, `Ход ${turn.stepNumber}: ${historyDescription(turn.sceneText)}`, {
+        kind: "rewind_prompt",
+        sessionId: session.id,
+        stateVersion: session.stateVersion,
+        targetStepNo: turn.stepNumber,
+      });
+    }
+  }
+  addButton(keyboard, "Назад к управлению", {
+    kind: "manage",
+    sessionId: session.id,
+    stateVersion: session.stateVersion,
+  });
+
+  const historyText = turns.map((turn) =>
+    `Ход ${turn.stepNumber}: ${historyDescription(turn.sceneText)}`
+  ).join("\n");
+  await showScreen(
+    context,
+    historyText.length === 0 ? "История ходов пуста." : `История прохождения:\n${historyText}`,
+    keyboard,
+  );
 }
 
 function failurePhase(callback: PrivateQuestCallback): FailurePhase {
@@ -374,6 +557,18 @@ function failurePhase(callback: PrivateQuestCallback): FailurePhase {
       return "session_open";
     case "choice":
       return "session_decision";
+    case "manage":
+    case "pause":
+    case "resume":
+    case "stop_prompt":
+    case "stop_confirm":
+    case "restart_prompt":
+    case "restart_confirm":
+      return "session_lifecycle";
+    case "rewind_list":
+    case "rewind_prompt":
+    case "rewind_confirm":
+      return "session_history";
     case "start":
       return "session_create";
     case "menu":
@@ -393,6 +588,213 @@ function isExpectedChoiceFailure(error: unknown): boolean {
     "INVALID_TRANSITION",
     "NOT_FOUND",
   ].includes(error.code);
+}
+
+function isSessionControlCallback(callback: PrivateQuestCallback): callback is SessionControlCallback {
+  switch (callback.kind) {
+    case "manage":
+    case "pause":
+    case "resume":
+    case "stop_prompt":
+    case "stop_confirm":
+    case "restart_prompt":
+    case "restart_confirm":
+    case "rewind_list":
+    case "rewind_prompt":
+    case "rewind_confirm":
+      return true;
+    default:
+      return false;
+  }
+}
+
+async function handleSessionControlCallback(
+  context: Context,
+  getApplication: GetPrivateQuestApplication,
+  owner: { type: "user"; id: string },
+  callback: SessionControlCallback,
+  logger: PrivateQuestLogger,
+): Promise<void> {
+  const refreshText = "Прохождение изменилось. Откройте /sessions и выберите его снова.";
+  let activePhase = failurePhase(callback);
+  let callbackAnswered = false;
+
+  const answer = async (text?: string): Promise<void> => {
+    if (callbackAnswered) {
+      return;
+    }
+    callbackAnswered = true;
+    try {
+      if (text === undefined) {
+        await context.answerCallbackQuery();
+      } else {
+        await context.answerCallbackQuery({ text });
+      }
+    } catch (error) {
+      logFailure(logger, activePhase, error);
+    }
+  };
+
+  try {
+    const application = await getApplication();
+    const session = await application.sessions.getSession(owner, callback.sessionId);
+    if (session.stateVersion !== callback.stateVersion) {
+      if (callback.kind === "manage") {
+        await answer(refreshText);
+        await showSessionControls(context, session);
+        return;
+      }
+      await answer(refreshText);
+      return;
+    }
+
+    switch (callback.kind) {
+      case "manage":
+        await answer();
+        await showSessionControls(context, session);
+        return;
+      case "pause": {
+        if (session.status !== "active") {
+          await answer(refreshText);
+          return;
+        }
+        const paused = await application.sessions.pauseSession(
+          owner,
+          session.id,
+          callback.stateVersion,
+        );
+        await answer();
+        activePhase = "scene";
+        await showSession(context, application, owner, paused.id, context.update.update_id);
+        return;
+      }
+      case "resume": {
+        if (session.status !== "paused") {
+          await answer(refreshText);
+          return;
+        }
+        const resumed = await application.sessions.resumeSession(
+          owner,
+          session.id,
+          callback.stateVersion,
+        );
+        await answer();
+        activePhase = "scene";
+        await showSession(context, application, owner, resumed.id, context.update.update_id);
+        return;
+      }
+      case "stop_prompt":
+        if (session.status === "completed") {
+          await answer(refreshText);
+          return;
+        }
+        await answer();
+        await showStopConfirmation(context, session);
+        return;
+      case "stop_confirm":
+        if (!callback.confirmed) {
+          await answer();
+          await showSessionControls(context, session);
+          return;
+        }
+        if (session.status === "completed") {
+          await answer(refreshText);
+          return;
+        }
+        {
+          const stopped = await application.sessions.stopSession(
+            owner,
+            session.id,
+            callback.stateVersion,
+          );
+          await answer();
+          activePhase = "scene";
+          await showSession(context, application, owner, stopped.id, context.update.update_id);
+          return;
+        }
+      case "restart_prompt":
+        await answer();
+        await showRestartConfirmation(context, session);
+        return;
+      case "restart_confirm":
+        if (!callback.confirmed) {
+          await answer();
+          await showSessionControls(context, session);
+          return;
+        }
+        {
+          const restarted = await application.sessions.restartSession(
+            owner,
+            session.id,
+            callback.stateVersion,
+            true,
+          );
+          await answer();
+          activePhase = "scene";
+          await showSession(context, application, owner, restarted.id, context.update.update_id);
+          return;
+        }
+      case "rewind_list": {
+        const turns = await application.sessions.listTurns(owner, session.id);
+        await answer();
+        await showSessionHistory(context, session, turns);
+        return;
+      }
+      case "rewind_prompt": {
+        if (session.status !== "active" && session.status !== "paused") {
+          await answer(refreshText);
+          return;
+        }
+        const turns = await application.sessions.listTurns(owner, session.id);
+        const target = turns.find((turn) => turn.stepNumber === callback.targetStepNo);
+        if (target === undefined) {
+          await answer(refreshText);
+          return;
+        }
+        await answer();
+        await showRewindConfirmation(context, session, target.stepNumber, target.sceneText);
+        return;
+      }
+      case "rewind_confirm":
+        if (!callback.confirmed) {
+          await answer();
+          await showSessionControls(context, session);
+          return;
+        }
+        if (session.status !== "active" && session.status !== "paused") {
+          await answer(refreshText);
+          return;
+        }
+        {
+          const turns = await application.sessions.listTurns(owner, session.id);
+          if (!turns.some((turn) => turn.stepNumber === callback.targetStepNo)) {
+            await answer(refreshText);
+            return;
+          }
+          const rewound = await application.sessions.rewindSession(
+            owner,
+            session.id,
+            callback.targetStepNo,
+            callback.stateVersion,
+          );
+          await answer();
+          activePhase = "scene";
+          await showSession(context, application, owner, rewound.id, context.update.update_id);
+          return;
+        }
+    }
+  } catch (error) {
+    logFailure(logger, activePhase, error);
+    if (!callbackAnswered) {
+      await answer(refreshText);
+      return;
+    }
+    try {
+      await context.reply("Экран не обновился. Откройте /sessions, чтобы увидеть актуальное состояние.");
+    } catch (recoveryError) {
+      logFailure(logger, activePhase, recoveryError);
+    }
+  }
 }
 
 async function handleChoiceCallback(
@@ -488,6 +890,10 @@ async function handleCallback(
 
   if (callback.kind === "choice") {
     await handleChoiceCallback(context, getApplication, owner, callback, logger);
+    return;
+  }
+  if (isSessionControlCallback(callback)) {
+    await handleSessionControlCallback(context, getApplication, owner, callback, logger);
     return;
   }
 
