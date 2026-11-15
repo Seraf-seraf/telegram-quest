@@ -3,6 +3,7 @@ import type {
   QuestVersion,
   Session,
   SessionOwner,
+  SessionStatus,
   Turn,
 } from "../domain/model.js";
 
@@ -30,6 +31,20 @@ export class SessionError extends Error {
 export interface SessionQuestVersion {
   questVersion: QuestVersion;
   questAvailable: boolean;
+}
+
+export interface OwnedSessionSummary {
+  id: string;
+  questVersionId: string;
+  questTitle: string;
+  questVersion: string;
+  status: SessionStatus;
+  stateVersion: number;
+}
+
+export interface OwnedSessionPage {
+  sessions: OwnedSessionSummary[];
+  nextCursor: string | null;
 }
 
 export interface CreateSessionRecord {
@@ -119,6 +134,12 @@ export interface SessionStore {
   getQuestVersion(questVersionId: string): Promise<SessionQuestVersion | null>;
   /** Returns the session and its single current open turn, without loading history. */
   getSession(owner: SessionOwner, sessionId: string): Promise<Session>;
+  /** Returns a bounded, owner-filtered page of session metadata without loading turns. */
+  listOwnedSessions(
+    owner: SessionOwner,
+    limit: number,
+    cursor: string | null,
+  ): Promise<OwnedSessionPage>;
   listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]>;
   /** Compares owner, pinned version and state version, then persists state and the first turn atomically. */
   startSession(input: StartSessionRecord): Promise<Session>;

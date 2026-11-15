@@ -15,6 +15,8 @@ import {
   type PauseSessionRecord,
   type RewindSessionRecord,
   type ResumeSessionRecord,
+  type OwnedSessionPage,
+  type OwnedSessionSummary,
   type SessionQuestVersion,
   type SessionStore,
   type SessionTransitionRecord,
@@ -197,6 +199,17 @@ function mapSession(row: SqlRow, turns: Turn[] = []): Session {
     turns,
     outcome,
     finalScene,
+  };
+}
+
+function mapOwnedSessionSummary(row: SqlRow): OwnedSessionSummary {
+  return {
+    id: readString(row, "id"),
+    questVersionId: readString(row, "quest_version_id"),
+    questTitle: readString(row, "quest_title"),
+    questVersion: readString(row, "quest_version"),
+    status: readStatus(row),
+    stateVersion: readInteger(row, "state_version"),
   };
 }
 
@@ -626,6 +639,39 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
 
     async getSession(owner: SessionOwner, sessionId: string): Promise<Session> {
       return inRead((executor) => readSession(executor, owner, sessionId));
+    },
+
+    async listOwnedSessions(
+      owner: SessionOwner,
+      limit: number,
+      cursor: string | null,
+    ): Promise<OwnedSessionPage> {
+      return inRead(async (executor) => {
+        const rows = await executor.all(
+          `SELECT session.id, session.quest_version_id, session.status,
+                  session.state_version, quest.title AS quest_title,
+                  quest_version.version AS quest_version
+             FROM session
+             JOIN quest_version ON quest_version.id = session.quest_version_id
+             JOIN quest ON quest.id = quest_version.quest_id
+            WHERE session.owner_type = ? AND session.owner_id = ?
+              AND (? IS NULL OR session.id COLLATE BINARY > ?)
+            ORDER BY session.id COLLATE BINARY ASC
+            LIMIT ?`,
+          owner.type,
+          owner.id,
+          cursor,
+          cursor,
+          limit + 1,
+        );
+        const sessions = rows.slice(0, limit).map(mapOwnedSessionSummary);
+        const hasNextPage = rows.length > limit;
+
+        return {
+          sessions,
+          nextCursor: hasNextPage ? sessions.at(-1)?.id ?? null : null,
+        };
+      });
     },
 
     async listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]> {

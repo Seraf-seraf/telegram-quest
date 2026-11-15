@@ -314,6 +314,54 @@ afterEach(async () => {
 });
 
 describe("Turso session store with local libSQL", () => {
+  it("lists bounded owner-only session summaries in deterministic pages", async () => {
+    const temporary = await createTemporaryDatabase();
+    cleanupDirectories.push(temporary.directory);
+    const database = temporary.database;
+    await ensureSchema(database);
+    await seedQuest(database);
+
+    const service = makeService(database, {
+      ids: ["session-a", "session-b", "session-c", "session-d", "session-e"],
+    });
+    await service.createSession(userOwner, "quest-version-1", 701);
+    await service.createSession(userOwner, "quest-version-1", 702);
+    await service.createSession(userOwner, "quest-version-1", 703);
+    await service.createSession(groupOwner, "quest-version-1", 704);
+    await service.createSession({ type: "user", id: "42" }, "quest-version-1", 705);
+
+    const store = createTursoSessionStore(database);
+    const firstPage = await store.listOwnedSessions(userOwner, 2, null);
+    expect(firstPage.sessions).toEqual([
+      {
+        id: "session-a",
+        questVersionId: "quest-version-1",
+        questTitle: "The Two Doors",
+        questVersion: "1.0.0",
+        status: "created",
+        stateVersion: 0,
+      },
+      {
+        id: "session-b",
+        questVersionId: "quest-version-1",
+        questTitle: "The Two Doors",
+        questVersion: "1.0.0",
+        status: "created",
+        stateVersion: 0,
+      },
+    ]);
+    expect(firstPage.nextCursor).toBe("session-b");
+
+    const secondPage = await store.listOwnedSessions(userOwner, 2, firstPage.nextCursor);
+    expect(secondPage.sessions.map((session) => session.id)).toEqual(["session-c"]);
+    expect(secondPage.nextCursor).toBeNull();
+    expect(secondPage.sessions[0]).not.toHaveProperty("turns");
+    expect(await store.listOwnedSessions(groupOwner, 2, null)).toMatchObject({
+      sessions: [{ id: "session-d", status: "created" }],
+      nextCursor: null,
+    });
+  }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
+
   it("persists a session and restores it through a new client without executing Ink", async () => {
     const temporary = await createTemporaryDatabase();
     cleanupDirectories.push(temporary.directory);

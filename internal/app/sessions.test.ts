@@ -11,6 +11,7 @@ import type {
 import { InkStoryRuntime } from "../adapters/ink/runtime.js";
 import {
   SessionError,
+  type OwnedSessionPage,
   type SessionStore,
   type SessionErrorCode,
   type ApplyDecisionRecord,
@@ -89,9 +90,11 @@ function makeStore(options: {
   questAvailable?: boolean;
   questVersionExists?: boolean;
   processedOperationIds?: number[];
+  ownedSessionsPage?: OwnedSessionPage;
 } = {}): SessionStore & {
   getQuestVersion: ReturnType<typeof vi.fn>;
   getSession: ReturnType<typeof vi.fn>;
+  listOwnedSessions: ReturnType<typeof vi.fn>;
   listTurns: ReturnType<typeof vi.fn>;
   startSession: ReturnType<typeof vi.fn>;
   createSession: ReturnType<typeof vi.fn>;
@@ -131,6 +134,11 @@ function makeStore(options: {
 
     return currentSession;
   });
+  const listOwnedSessions = vi.fn(async (
+    _owner: SessionOwner,
+    _limit: number,
+    _cursor: string | null,
+  ) => options.ownedSessionsPage ?? { sessions: [], nextCursor: null });
   const listTurns = vi.fn(async (owner: SessionOwner, id: string) => {
     await getSession(owner, id);
     return [...currentSession.turns];
@@ -290,6 +298,7 @@ function makeStore(options: {
     createSession,
     getQuestVersion,
     getSession,
+    listOwnedSessions,
     listTurns,
     startSession,
     hasProcessedOperation,
@@ -355,6 +364,38 @@ async function expectSessionError(
 }
 
 describe("SessionService", () => {
+  it("normalizes owner session page size and delegates the cursor", async () => {
+    const page: OwnedSessionPage = {
+      sessions: [{
+        id: "session-a",
+        questVersionId: questVersion.id,
+        questTitle: "The Two Doors",
+        questVersion: "1.0.0",
+        status: "active",
+        stateVersion: 3,
+      }],
+      nextCursor: "session-a",
+    };
+    const store = makeStore({ ownedSessionsPage: page });
+    const { service } = makeService({ store });
+
+    await expect(service.listOwnedSessions(userOwner, 1000, "session-before"))
+      .resolves.toBe(page);
+    expect(store.listOwnedSessions).toHaveBeenCalledWith(userOwner, 50, "session-before");
+  });
+
+  it("rejects invalid owners, page sizes, and cursors before storage access", async () => {
+    const { service, store } = makeService();
+
+    await expect(async () => service.listOwnedSessions({ type: "user", id: " 41" }, 10))
+      .rejects.toMatchObject({ name: "SessionError", code: "INVALID_TRANSITION" });
+    await expect(async () => service.listOwnedSessions(userOwner, 0))
+      .rejects.toMatchObject({ name: "SessionError", code: "INVALID_TRANSITION" });
+    await expect(async () => service.listOwnedSessions(userOwner, 10, " session-a"))
+      .rejects.toMatchObject({ name: "SessionError", code: "INVALID_TRANSITION" });
+    expect(store.listOwnedSessions).not.toHaveBeenCalled();
+  });
+
   it("creates a created session without an Ink state", async () => {
     const { service, store } = makeService();
 

@@ -12,12 +12,16 @@ import {
   type PauseSessionRecord,
   type ResumeSessionRecord,
   type RewindSessionRecord,
+  type OwnedSessionPage,
   type SessionTransitionRecord,
   type StartSessionRecord,
   type SessionStore,
 } from "./session-store.js";
 import { StoryRuntimeError, type StoryRuntime, type StoryStep } from "./story.js";
 import { StorySourceError, type StorySource } from "./story-source.js";
+
+const DEFAULT_SESSION_PAGE_ITEMS = 20;
+const MAX_SESSION_PAGE_ITEMS = 50;
 
 export interface GroupTurnPolicy {
   voteDurationMs: number;
@@ -534,6 +538,29 @@ export class SessionService {
   public getSession(owner: SessionOwner, sessionId: string): Promise<Session> {
     assertOwner(owner);
     return this.store.getSession(owner, sessionId);
+  }
+
+  public listOwnedSessions(
+    owner: SessionOwner,
+    limit: number = DEFAULT_SESSION_PAGE_ITEMS,
+    cursor: string | null = null,
+  ): Promise<OwnedSessionPage> {
+    assertOwner(owner);
+
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new SessionError("INVALID_TRANSITION", "Session page size is invalid.");
+    }
+
+    if (cursor !== null &&
+      (typeof cursor !== "string" || cursor.length === 0 || cursor.trim() !== cursor)) {
+      throw new SessionError("INVALID_TRANSITION", "Session page cursor is invalid.");
+    }
+
+    return this.store.listOwnedSessions(
+      owner,
+      Math.min(limit, MAX_SESSION_PAGE_ITEMS),
+      cursor,
+    );
   }
 
   public listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]> {

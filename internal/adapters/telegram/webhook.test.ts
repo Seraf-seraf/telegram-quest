@@ -1,5 +1,6 @@
 import { Bot } from "grammy";
 import { describe, expect, it, vi } from "vitest";
+import { registerPrivateQuestHandlers } from "./private-quest.js";
 import { createTelegramWebhookHandler } from "./webhook.js";
 
 const botToken = "123456:fake-bot-token";
@@ -40,8 +41,11 @@ describe("createTelegramWebhookHandler", () => {
 
   it("rejects an invalid secret before calling the Telegram API", async () => {
     const fetchMock = createTelegramApiFetchMock();
-
     const bot = new Bot(botToken, { client: { fetch: fetchMock } });
+    const getApplication = vi.fn(async () => {
+      throw new Error("Application must not initialize for an invalid secret.");
+    });
+    registerPrivateQuestHandlers(bot, getApplication);
     const handleWebhook = createTelegramWebhookHandler(bot, secretToken);
     const response = await handleWebhook(
       createRequest(
@@ -51,6 +55,7 @@ describe("createTelegramWebhookHandler", () => {
     );
 
     expect(response.status).toBe(401);
+    expect(getApplication).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
