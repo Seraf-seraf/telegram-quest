@@ -117,6 +117,25 @@ async function compileTaggedStory(): Promise<string> {
   return compileInkStory(directory);
 }
 
+async function compileDialogueStory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "telegram-quest-dialogue-"));
+  temporaryDirectories.push(directory);
+  await writeFile(join(directory, "story.ink"), [
+    "-> start",
+    "=== start",
+    "Первый голос... дальше # dialogue:stream",
+    "+ [Сказать] -> brother",
+    "=== brother",
+    "— Брат: Подожди. # dialogue:stream",
+    "+ [Продолжить] -> ending",
+    "=== ending",
+    "Финал главы. # dialogue:stream",
+    "-> END",
+    "",
+  ].join("\n"), "utf8");
+  return compileInkStory(directory);
+}
+
 afterEach(async () => {
   for (const database of openDatabases) {
     database.close();
@@ -343,6 +362,66 @@ function latestMessageId(calls: TelegramCall[]): number {
 }
 
 describe("private quest Telegram handlers", () => {
+  it("keeps the dialogue choice, streams final output, and reopens a saved speech turn without theatre", async () => {
+    const database = createMemoryDatabase();
+    const storyJson = await compileDialogueStory();
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+      storySource: { load: async () => storyJson },
+    });
+    await database.write((executor) => executor.run(
+      `INSERT INTO quest (id, title, description, genre, available, story_json)
+       VALUES (?, ?, ?, ?, 1, ?)`,
+      "dialogue-story", "Dialogue story", "Dialogue test", "Test", storyJson,
+    ));
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    registerPrivateQuestHandlers(bot, async () => app);
+
+    await bot.handleUpdate(commandUpdate(1, privateUserId, "/quests"));
+    await bot.handleUpdate(callbackUpdate(2, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "Dialogue story")));
+    await bot.handleUpdate(callbackUpdate(3, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "▶ Начать прохождение")));
+    expect(latestScreen(telegram.calls).payload.text).toBe("Первый голос... дальше\n");
+    const sessionId = (await app.sessions.listOwnedSessions(
+      { type: "user", id: String(privateUserId) }, 20, null,
+    )).sessions[0]?.id;
+    if (sessionId === undefined) throw new Error("Dialogue session was not created.");
+
+    const draftCount = telegram.calls.filter((call) => call.method === "sendMessageDraft").length;
+    await bot.handleUpdate(callbackUpdate(4, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "Сказать")));
+    expect(latestScreen(telegram.calls).payload.text).toBe("— Брат: Подожди.\n");
+    expect(telegram.calls.filter((call) => call.method === "sendMessageDraft").length - draftCount).toBe(1);
+    await bot.handleUpdate(commandUpdate(5, privateUserId, "/sessions"));
+    const replayDraftCount = telegram.calls.filter((call) => call.method === "sendMessageDraft").length;
+    const owner = { type: "user" as const, id: String(privateUserId) };
+    await bot.handleUpdate(callbackUpdate(
+      6, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, `Dialogue story · ${sessionId.slice(0, 8)} · в процессе`),
+    ));
+    expect(latestScreen(telegram.calls).payload.text).toBe("— Брат: Подожди.\n");
+    expect(telegram.calls.filter((call) => call.method === "sendMessageDraft").length - replayDraftCount).toBe(3);
+    expect((await app.sessions.getSession(owner, sessionId)).status).toBe("active");
+    const finalDraftCount = telegram.calls.filter((call) => call.method === "sendMessageDraft").length;
+    await bot.handleUpdate(callbackUpdate(7, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "Продолжить")));
+    expect(latestScreen(telegram.calls).payload.text).toBe("Финал главы.\n");
+    expect(telegram.calls.filter((call) => call.method === "sendMessageDraft").length - finalDraftCount).toBe(1);
+    expect((await app.sessions.getSession(owner, sessionId)).status).toBe("completed");
+
+    const recovered = await app.sessions.createSession(owner, "dialogue-story", 8);
+    await bot.handleUpdate(commandUpdate(8, privateUserId, "/sessions"));
+    const recoveredDraftCount = telegram.calls.filter((call) => call.method === "sendMessageDraft").length;
+    await bot.handleUpdate(callbackUpdate(
+      9,
+      privateUserId,
+      latestMessageId(telegram.calls),
+      buttonData(telegram.calls, `Dialogue story · ${recovered.id.slice(0, 8)} · не начат`),
+    ));
+    expect(latestScreen(telegram.calls).payload.text).toBe("Первый голос... дальше\n");
+    expect(telegram.calls.filter((call) => call.method === "sendMessageDraft").length - recoveredDraftCount).toBe(1);
+    expect((await app.sessions.getSession(owner, recovered.id)).status).toBe("active");
+  });
+
   it("keeps personal commands private and creates recoverable owner sessions", async () => {
     const database = createMemoryDatabase();
     const app = await initializeApp(validEnv, {

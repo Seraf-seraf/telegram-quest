@@ -26,7 +26,7 @@ import {
   presentMenu,
   resolveMenuCallbackData,
 } from "./menu-presenter.js";
-import { sendScene } from "./scene-presenter.js";
+import { sendScene, type SceneDisplayOptions } from "./scene-presenter.js";
 
 const PRIVATE_SESSION_PAGE_ITEMS = 20;
 
@@ -404,6 +404,7 @@ async function sendSessionOutput(
   application: PrivateQuestApplication,
   session: Session,
   updateId: number,
+  replay = false,
 ): Promise<void> {
   const chatId = context.chatId;
   if (chatId === undefined) {
@@ -417,7 +418,7 @@ async function sendSessionOutput(
         session.finalScene.text,
         assetReferences(session.finalScene.tags),
       );
-      await sendScene(context.api, chatId, view, updateId);
+      await sendScene(context.api, chatId, view, updateId, undefined, sceneDisplay(session.finalScene.tags, replay));
     }
     return;
   }
@@ -443,6 +444,7 @@ async function sendSessionOutput(
       view,
       updateId,
       keyboard.inline_keyboard.length === 0 ? undefined : keyboard,
+      sceneDisplay(turn.sceneTags, replay),
     );
     return;
   }
@@ -452,7 +454,17 @@ async function sendSessionOutput(
     turn.sceneText,
     assetReferences(turn.sceneTags),
   );
-  await sendScene(context.api, chatId, view, updateId);
+  await sendScene(context.api, chatId, view, updateId, undefined, sceneDisplay(turn.sceneTags, replay));
+}
+
+function sceneDisplay(tags: readonly string[], replay: boolean): SceneDisplayOptions {
+  const noPauseLines: number[] = [];
+  for (const tag of tags) {
+    const match = /^dialogue:no-pause-line:(\d+)$/u.exec(tag);
+    const line = Number(match?.[1]);
+    if (Number.isSafeInteger(line) && line >= 1) noPauseLines.push(line);
+  }
+  return { stream: tags.includes("dialogue:stream"), replay, noPauseLines };
 }
 
 async function showSession(
@@ -461,9 +473,11 @@ async function showSession(
   owner: { type: "user"; id: string },
   sessionId: string,
   updateId: number,
+  replay = false,
 ): Promise<void> {
   let session = await application.sessions.getSession(owner, sessionId);
-  if (session.status === "created") {
+  const isNewSession = session.status === "created";
+  if (isNewSession) {
     session = await application.sessions.startSession(owner, session.id, session.stateVersion);
   }
 
@@ -481,7 +495,7 @@ async function showSession(
     `${title}\nСтатус: ${statusLabel(session.status)}\n\n${sessionMessage}`,
     sessionMenuKeyboard(session),
   );
-  await sendSessionOutput(context, application, session, updateId);
+  await sendSessionOutput(context, application, session, updateId, replay && !isNewSession);
 }
 
 function sessionControlsKeyboard(session: Session): InlineKeyboard {
@@ -743,7 +757,7 @@ async function handleSessionControlCallback(
         );
         await answer();
         activePhase = "scene";
-        await showSession(context, application, owner, paused.id, context.update.update_id);
+        await showSession(context, application, owner, paused.id, context.update.update_id, true);
         return;
       }
       case "resume": {
@@ -758,7 +772,7 @@ async function handleSessionControlCallback(
         );
         await answer();
         activePhase = "scene";
-        await showSession(context, application, owner, resumed.id, context.update.update_id);
+        await showSession(context, application, owner, resumed.id, context.update.update_id, true);
         return;
       }
       case "stop_prompt":
@@ -787,7 +801,7 @@ async function handleSessionControlCallback(
           );
           await answer();
           activePhase = "scene";
-          await showSession(context, application, owner, stopped.id, context.update.update_id);
+          await showSession(context, application, owner, stopped.id, context.update.update_id, true);
           return;
         }
       case "restart_prompt":
@@ -861,7 +875,7 @@ async function handleSessionControlCallback(
           );
           await answer();
           activePhase = "scene";
-          await showSession(context, application, owner, rewound.id, context.update.update_id);
+          await showSession(context, application, owner, rewound.id, context.update.update_id, true);
           return;
         }
     }
@@ -1072,7 +1086,7 @@ async function handleCallback(
         return;
       case "session":
         activePhase = "session_open";
-        await showSession(context, application, owner, callback.sessionId, context.update.update_id);
+        await showSession(context, application, owner, callback.sessionId, context.update.update_id, true);
         return;
     }
   } catch (error) {
