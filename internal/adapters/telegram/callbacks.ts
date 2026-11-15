@@ -1,14 +1,14 @@
 import { Buffer } from "node:buffer";
 
 const CALLBACK_PROTOCOL_VERSION = "v1";
+const QUEST_CALLBACK_PROTOCOL_VERSION = "q2";
 const MAX_CALLBACK_DATA_BYTES = 64;
 
 export type PrivateQuestCallback =
   | { kind: "menu" }
   | { kind: "quests" }
   | { kind: "quest"; questId: string }
-  | { kind: "version"; versionId: string }
-  | { kind: "start"; versionId: string }
+  | { kind: "start"; questId: string }
   | { kind: "sessions" }
   | { kind: "sessions_page"; cursor: string }
   | { kind: "session"; sessionId: string }
@@ -130,13 +130,10 @@ export function encodePrivateQuestCallback(callback: PrivateQuestCallback): stri
       data = `${CALLBACK_PROTOCOL_VERSION}:q`;
       break;
     case "quest":
-      data = `${CALLBACK_PROTOCOL_VERSION}:q:${encodeId(callback.questId)}`;
-      break;
-    case "version":
-      data = `${CALLBACK_PROTOCOL_VERSION}:v:${encodeId(callback.versionId)}`;
+      data = `${QUEST_CALLBACK_PROTOCOL_VERSION}:c:${encodeId(callback.questId)}`;
       break;
     case "start":
-      data = `${CALLBACK_PROTOCOL_VERSION}:s:${encodeId(callback.versionId)}`;
+      data = `${QUEST_CALLBACK_PROTOCOL_VERSION}:s:${encodeId(callback.questId)}`;
       break;
     case "sessions":
       data = `${CALLBACK_PROTOCOL_VERSION}:l`;
@@ -198,11 +195,29 @@ export function parsePrivateQuestCallback(data: unknown): PrivateQuestCallback |
   }
 
   const parts = data.split(":");
-  if (parts[0] !== CALLBACK_PROTOCOL_VERSION) {
+  const protocol = parts[0];
+  const operation = parts[1];
+  if (protocol === QUEST_CALLBACK_PROTOCOL_VERSION) {
+    if (parts.length !== 3) {
+      return null;
+    }
+    const questId = decodeId(parts[2]);
+    if (questId === null) {
+      return null;
+    }
+    if (operation === "c") {
+      return { kind: "quest", questId };
+    }
+    if (operation === "s") {
+      return { kind: "start", questId };
+    }
     return null;
   }
 
-  const operation = parts[1];
+  if (protocol !== CALLBACK_PROTOCOL_VERSION) {
+    return null;
+  }
+
   switch (operation) {
     case "m":
       return parts.length === 2 ? { kind: "menu" } : null;
@@ -215,20 +230,6 @@ export function parsePrivateQuestCallback(data: unknown): PrivateQuestCallback |
         return questId === null ? null : { kind: "quest", questId };
       }
       return null;
-    case "v": {
-      if (parts.length !== 3) {
-        return null;
-      }
-      const versionId = decodeId(parts[2]);
-      return versionId === null ? null : { kind: "version", versionId };
-    }
-    case "s": {
-      if (parts.length !== 3) {
-        return null;
-      }
-      const versionId = decodeId(parts[2]);
-      return versionId === null ? null : { kind: "start", versionId };
-    }
     case "l":
       if (parts.length === 2) {
         return { kind: "sessions" };

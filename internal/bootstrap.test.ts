@@ -53,15 +53,15 @@ describe("initializeApp", () => {
       ensureSchema: async (receivedDatabase) => {
         calls.push(`schema:${receivedDatabase === database}`);
       },
-      ensureDemoCatalog: async (receivedDatabase, storySource) => {
-        calls.push(`catalog:${receivedDatabase === database}:${typeof storySource.load}`);
+      ensureDemoCatalog: async (receivedDatabase) => {
+        calls.push(`catalog:${receivedDatabase === database}`);
       },
     }));
 
     expect(calls).toEqual([
       "connect:libsql://quest-example.turso.io",
       "schema:true",
-      "catalog:true:function",
+      "catalog:true",
     ]);
     expect(result.database).toBe(database);
     expect(result.storyRuntime).toBeDefined();
@@ -80,7 +80,7 @@ describe("initializeApp", () => {
 
     expect(result.sessions).toBeInstanceOf(SessionService);
     expect(result.sessions.getSession).toBeTypeOf("function");
-    expect(result.catalog.listVersions).toBeTypeOf("function");
+    expect(result.catalog.getQuest).toBeTypeOf("function");
     expect(result.storyRuntime).toBeDefined();
   });
 

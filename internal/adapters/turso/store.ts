@@ -2,7 +2,7 @@ import type {
   Choice,
   FinalScene,
   Outcome,
-  QuestVersion,
+  Quest,
   Session,
   SessionOwner,
   SessionStatus,
@@ -17,7 +17,7 @@ import {
   type ResumeSessionRecord,
   type OwnedSessionPage,
   type OwnedSessionSummary,
-  type SessionQuestVersion,
+  type SessionQuest,
   type SessionStore,
   type SessionTransitionRecord,
   type StartSessionRecord,
@@ -191,7 +191,7 @@ function mapSession(row: SqlRow, turns: Turn[] = []): Session {
 
   return {
     id: readString(row, "id"),
-    questVersionId: readString(row, "quest_version_id"),
+    questId: readString(row, "quest_id"),
     owner: readOwner(row),
     status: readStatus(row),
     inkState: readNullableString(row, "ink_state_json"),
@@ -205,9 +205,8 @@ function mapSession(row: SqlRow, turns: Turn[] = []): Session {
 function mapOwnedSessionSummary(row: SqlRow): OwnedSessionSummary {
   return {
     id: readString(row, "id"),
-    questVersionId: readString(row, "quest_version_id"),
+    questId: readString(row, "quest_id"),
     questTitle: readString(row, "quest_title"),
-    questVersion: readString(row, "quest_version"),
     status: readStatus(row),
     stateVersion: readInteger(row, "state_version"),
   };
@@ -235,41 +234,35 @@ function asStorageFailure(error: unknown): SessionError {
   });
 }
 
-async function readQuestVersion(
+function readQuestAvailability(row: SqlRow): boolean {
+  const available = readInteger(row, "available");
+  if (available !== 0 && available !== 1) {
+    throw invalidStorageData("quest availability");
+  }
+  return available === 1;
+}
+
+async function readQuest(
   executor: SqlExecutor,
-  questVersionId: string,
-): Promise<SessionQuestVersion | null> {
+  questId: string,
+): Promise<SessionQuest | null> {
   const row = await executor.get(
-    `SELECT quest_version.id AS version_id,
-            quest_version.quest_id AS quest_id,
-            quest_version.version AS version,
-            quest_version.story_ref AS story_ref,
-            quest_version.story_hash AS story_hash,
-            quest.available AS quest_available
-       FROM quest_version
-       JOIN quest ON quest.id = quest_version.quest_id
-      WHERE quest_version.id = ?`,
-    questVersionId,
+    "SELECT id, title, description, genre, available FROM quest WHERE id = ?",
+    questId,
   );
 
   if (row === undefined) {
     return null;
   }
 
-  const questVersion: QuestVersion = {
-    id: readString(row, "version_id"),
-    questId: readString(row, "quest_id"),
-    version: readString(row, "version"),
-    storyReference: readString(row, "story_ref"),
-    storyHash: readString(row, "story_hash"),
+  const quest: Quest = {
+    id: readString(row, "id"),
+    title: readString(row, "title"),
+    description: readString(row, "description"),
+    genre: readString(row, "genre"),
+    available: readQuestAvailability(row),
   };
-  const available = readInteger(row, "quest_available");
-
-  if (available !== 0 && available !== 1) {
-    throw invalidStorageData("quest availability");
-  }
-
-  return { questVersion, questAvailable: available === 1 };
+  return { quest, questAvailable: quest.available };
 }
 
 async function readSessionRow(
@@ -277,7 +270,7 @@ async function readSessionRow(
   sessionId: string,
 ): Promise<SqlRow | undefined> {
   return executor.get(
-    `SELECT id, quest_version_id, owner_type, owner_id, status, ink_state_json,
+    `SELECT id, quest_id, owner_type, owner_id, status, ink_state_json,
             state_version, outcome, final_scene_text, final_scene_tags_json
        FROM session
       WHERE id = ?`,
@@ -328,7 +321,7 @@ async function readSession(
   sessionId: string,
 ): Promise<Session> {
   const rows = await executor.all(
-    `SELECT session.id, session.quest_version_id, session.owner_type, session.owner_id,
+    `SELECT session.id, session.quest_id, session.owner_type, session.owner_id,
             session.status, session.ink_state_json, session.state_version, session.outcome,
             session.final_scene_text, session.final_scene_tags_json,
             turn.id AS current_turn_id,
@@ -377,9 +370,9 @@ async function readSession(
   return mapSession(row, currentTurns);
 }
 
-function assertVersionAvailable(details: SessionQuestVersion | null): SessionQuestVersion {
+function assertQuestAvailable(details: SessionQuest | null): SessionQuest {
   if (details === null) {
-    throw new SessionError("NOT_FOUND", "Quest version was not found.");
+    throw new SessionError("NOT_FOUND", "Quest was not found.");
   }
 
   if (!details.questAvailable) {
@@ -415,8 +408,8 @@ function validateActiveStart(input: Extract<StartSessionRecord, { kind: "active"
     turn.id.length === 0 ||
     !isJsonObject(turn.inkCheckpoint) ||
     typeof turn.sceneText !== "string" ||
-    input.questVersionId.length === 0 ||
-    !/^[a-f\d]{64}$/i.test(input.storyHash)
+    input.questId.length === 0 ||
+    input.questId.trim() !== input.questId
   ) {
     throw new SessionError("INVALID_TRANSITION", "Initial session turn is invalid.");
   }
@@ -451,8 +444,8 @@ function validateCompletedStart(
     input.expectedStateVersion < 0 ||
     !Number.isSafeInteger(input.expectedStateVersion) ||
     !isJsonObject(input.inkState) ||
-    input.questVersionId.length === 0 ||
-    !/^[a-f\d]{64}$/i.test(input.storyHash) ||
+    input.questId.length === 0 ||
+    input.questId.trim() !== input.questId ||
     typeof input.finalScene.text !== "string" ||
     !Array.isArray(input.finalScene.tags) ||
     input.finalScene.tags.some((tag) => typeof tag !== "string")
@@ -473,8 +466,8 @@ function validateDecision(input: ApplyDecisionRecord): void {
     input.processedAtMs < 0 ||
     input.sessionId.length === 0 ||
     input.turnId.length === 0 ||
-    input.questVersionId.length === 0 ||
-    !/^[a-f\d]{64}$/i.test(input.storyHash) ||
+    input.questId.length === 0 ||
+    input.questId.trim() !== input.questId ||
     !isJsonObject(input.inkState)
   ) {
     throw new SessionError("INVALID_TRANSITION", "Decision record is invalid.");
@@ -586,14 +579,14 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
   }
 
   return {
-    async getQuestVersion(questVersionId: string): Promise<SessionQuestVersion | null> {
-      return inRead((executor) => readQuestVersion(executor, questVersionId));
+    async getQuest(questId: string): Promise<SessionQuest | null> {
+      return inRead((executor) => readQuest(executor, questId));
     },
 
     async createSession(input: CreateSessionRecord): Promise<Session> {
       return inWrite(async (executor) => {
-        const details = assertVersionAvailable(
-          await readQuestVersion(executor, input.questVersionId),
+        const details = assertQuestAvailable(
+          await readQuest(executor, input.questId),
         );
 
         try {
@@ -612,10 +605,10 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
 
         try {
           await executor.run(
-            `INSERT INTO session (id, quest_version_id, owner_type, owner_id)
+            `INSERT INTO session (id, quest_id, owner_type, owner_id)
              VALUES (?, ?, ?, ?)`,
             input.sessionId,
-            details.questVersion.id,
+            details.quest.id,
             input.owner.type,
             input.owner.id,
           );
@@ -648,12 +641,10 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
     ): Promise<OwnedSessionPage> {
       return inRead(async (executor) => {
         const rows = await executor.all(
-          `SELECT session.id, session.quest_version_id, session.status,
-                  session.state_version, quest.title AS quest_title,
-                  quest_version.version AS quest_version
+          `SELECT session.id, session.quest_id, session.status,
+                  session.state_version, quest.title AS quest_title
              FROM session
-             JOIN quest_version ON quest_version.id = session.quest_version_id
-             JOIN quest ON quest.id = quest_version.quest_id
+             JOIN quest ON quest.id = session.quest_id
             WHERE session.owner_type = ? AND session.owner_id = ?
               AND (? IS NULL OR session.id COLLATE BINARY > ?)
             ORDER BY session.id COLLATE BINARY ASC
@@ -700,18 +691,11 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           throw new SessionError("INVALID_TRANSITION", "Session cannot be started.");
         }
 
-        if (readString(row, "quest_version_id") !== input.questVersionId) {
-          throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+        if (readString(row, "quest_id") !== input.questId) {
+          throw new SessionError("STORY_MISMATCH", "Session is linked to another quest.");
         }
 
-        const latestVersion = assertVersionAvailable(
-          await readQuestVersion(executor, input.questVersionId),
-        );
-        if (
-          latestVersion.questVersion.storyHash.toLowerCase() !== input.storyHash.toLowerCase()
-        ) {
-          throw new SessionError("STORY_MISMATCH", "Quest version changed while it was loading.");
-        }
+        assertQuestAvailable(await readQuest(executor, input.questId));
 
         const finalScene = input.kind === "completed" ? input.finalScene : null;
         const status = input.kind === "completed" ? "completed" : "active";
@@ -797,19 +781,13 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
           throw new SessionError("INVALID_TRANSITION", "Session cannot accept a decision.");
         }
 
-        if (readString(sessionRow, "quest_version_id") !== input.questVersionId) {
-          throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+        if (readString(sessionRow, "quest_id") !== input.questId) {
+          throw new SessionError("STORY_MISMATCH", "Session is linked to another quest.");
         }
 
-        const latestVersion = await readQuestVersion(executor, input.questVersionId);
-        if (latestVersion === null) {
-          throw new SessionError("NOT_FOUND", "Quest version was not found.");
-        }
-        if (
-          latestVersion.questVersion.id !== input.questVersionId ||
-          latestVersion.questVersion.storyHash.toLowerCase() !== input.storyHash.toLowerCase()
-        ) {
-          throw new SessionError("STORY_MISMATCH", "Quest version changed while it was loading.");
+        const latestQuest = await readQuest(executor, input.questId);
+        if (latestQuest === null) {
+          throw new SessionError("NOT_FOUND", "Quest was not found.");
         }
 
         const currentSession = await readSession(executor, input.owner, input.sessionId);
@@ -1107,19 +1085,11 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
         if (readInteger(sessionRow, "state_version") !== input.expectedStateVersion) {
           throw new SessionError("CONFLICT", "Session state changed.");
         }
-        if (readString(sessionRow, "quest_version_id") !== input.questVersionId) {
-          throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
+        if (readString(sessionRow, "quest_id") !== input.questId) {
+          throw new SessionError("STORY_MISMATCH", "Session is linked to another quest.");
         }
 
-        const latestVersion = assertVersionAvailable(
-          await readQuestVersion(executor, input.questVersionId),
-        );
-        if (
-          latestVersion.questVersion.id !== input.questVersionId ||
-          latestVersion.questVersion.storyHash.toLowerCase() !== input.storyHash.toLowerCase()
-        ) {
-          throw new SessionError("STORY_MISMATCH", "Quest version changed while it was loading.");
-        }
+        assertQuestAvailable(await readQuest(executor, input.questId));
 
         if (input.kind === "active") {
           const oldTurn = await executor.get(
@@ -1146,7 +1116,7 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
                     final_scene_text = ?,
                     final_scene_tags_json = ?
               WHERE id = ? AND owner_type = ? AND owner_id = ?
-                AND quest_version_id = ? AND state_version = ?
+                AND quest_id = ? AND state_version = ?
             RETURNING id`,
             completed ? "completed" : "active",
             input.inkState,
@@ -1156,7 +1126,7 @@ export function createTursoSessionStore(database: TursoDatabase): SessionStore {
             input.sessionId,
             input.owner.type,
             input.owner.id,
-            input.questVersionId,
+            input.questId,
             input.expectedStateVersion,
           );
         } catch (error) {

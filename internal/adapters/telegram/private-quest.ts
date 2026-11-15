@@ -227,68 +227,24 @@ async function showQuestList(
   await showScreen(context, text, keyboard);
 }
 
-async function showQuestVersions(
+async function showQuestCard(
   context: Context,
   application: PrivateQuestApplication,
   questId: string,
 ): Promise<void> {
-  const quests = await application.catalog.listAvailableQuests();
-  const quest = quests.find((item) => item.id === questId);
-  if (quest === undefined) {
+  const quest = await application.catalog.getQuest(questId);
+  if (quest === null || !quest.available) {
     const keyboard = mainMenuKeyboard();
     await showScreen(context, "Квест больше недоступен. Откройте каталог заново.", keyboard);
     return;
   }
 
-  const versions = await application.catalog.listVersions(quest.id);
   const keyboard = new InlineKeyboard();
-  let skippedButtons = 0;
-  for (const version of versions) {
-    if (!addButton(keyboard, `Версия ${version.version}`, {
-      kind: "version",
-      versionId: version.id,
-    })) {
-      skippedButtons += 1;
-    }
-  }
+  addButton(keyboard, "Начать прохождение", { kind: "start", questId: quest.id });
   addButton(keyboard, "Назад к квестам", { kind: "quests" });
   addButton(keyboard, "В меню", { kind: "menu" });
 
-  let text = `${quest.title}\nЖанр: ${quest.genre}\n\n${quest.description}`;
-  text += versions.length === 0 ? "\n\nДоступных версий пока нет." : "\n\nВыберите версию.";
-  if (skippedButtons > 0) {
-    text += " Некоторые версии нельзя открыть из-за длины их идентификатора.";
-  }
-  await showScreen(context, text, keyboard);
-}
-
-async function showVersion(
-  context: Context,
-  application: PrivateQuestApplication,
-  versionId: string,
-): Promise<void> {
-  const version = await application.catalog.getQuestVersion(versionId);
-  if (version === null) {
-    await showScreen(context, "Версия больше недоступна. Откройте каталог заново.", mainMenuKeyboard());
-    return;
-  }
-
-  const quests = await application.catalog.listAvailableQuests();
-  const quest = quests.find((item) => item.id === version.questId);
-  if (quest === undefined) {
-    await showScreen(context, "Квест больше недоступен. Откройте каталог заново.", mainMenuKeyboard());
-    return;
-  }
-
-  const keyboard = new InlineKeyboard();
-  addButton(keyboard, "Начать", { kind: "start", versionId: version.id });
-  addButton(keyboard, "Назад к версиям", { kind: "quest", questId: quest.id });
-  addButton(keyboard, "В меню", { kind: "menu" });
-  await showScreen(
-    context,
-    `${quest.title}\nВерсия ${version.version}\n\n${quest.description}`,
-    keyboard,
-  );
+  await showScreen(context, `${quest.title}\nЖанр: ${quest.genre}\n\n${quest.description}`, keyboard);
 }
 
 async function showSessions(
@@ -306,7 +262,7 @@ async function showSessions(
   let skippedButtons = 0;
 
   for (const session of page.sessions) {
-    const label = `${session.questTitle} · ${session.questVersion} · ${statusLabel(session.status)}`;
+    const label = `${session.questTitle} · ${statusLabel(session.status)}`;
     if (!addButton(keyboard, label, { kind: "session", sessionId: session.id })) {
       skippedButtons += 1;
     }
@@ -377,11 +333,8 @@ async function showSession(
     session = await application.sessions.startSession(owner, session.id, session.stateVersion);
   }
 
-  const version = await application.catalog.getQuestVersion(session.questVersionId);
-  const quests = version === null ? [] : await application.catalog.listAvailableQuests();
-  const quest = version === null ? undefined : quests.find((item) => item.id === version.questId);
+  const quest = await application.catalog.getQuest(session.questId);
   const title = quest?.title ?? "Квест";
-  const versionText = version === null ? "" : ` · версия ${version.version}`;
   const sessionMessage = session.status === "paused"
     ? "Прохождение на паузе."
     : session.status === "completed"
@@ -391,7 +344,7 @@ async function showSession(
       : "Продолжение загружено из сохранённого прохождения.";
   await showScreen(
     context,
-    `${title}${versionText}\nСтатус: ${statusLabel(session.status)}\n\n${sessionMessage}`,
+    `${title}\nСтатус: ${statusLabel(session.status)}\n\n${sessionMessage}`,
     sessionMenuKeyboard(session),
   );
   await sendSessionOutput(context, session, updateId);
@@ -574,7 +527,6 @@ function failurePhase(callback: PrivateQuestCallback): FailurePhase {
     case "menu":
     case "quests":
     case "quest":
-    case "version":
       return "catalog";
   }
 }
@@ -884,7 +836,7 @@ async function handleCallback(
 
   const callback = parsePrivateQuestCallback(context.callbackQuery?.data);
   if (callback === null) {
-    await context.answerCallbackQuery({ text: "Кнопка устарела. Откройте /menu." });
+    await context.answerCallbackQuery({ text: "Меню обновилось. Откройте /menu" });
     return;
   }
 
@@ -910,22 +862,19 @@ async function handleCallback(
         await showQuestList(context, application);
         return;
       case "quest":
-        await showQuestVersions(context, application, callback.questId);
-        return;
-      case "version":
-        await showVersion(context, application, callback.versionId);
+        await showQuestCard(context, application, callback.questId);
         return;
       case "start": {
         activePhase = "session_create";
-        const version = await application.catalog.getQuestVersion(callback.versionId);
-        if (version === null) {
-          await showScreen(context, "Версия больше недоступна. Откройте каталог заново.", mainMenuKeyboard());
+        const quest = await application.catalog.getQuest(callback.questId);
+        if (quest === null || !quest.available) {
+          await showScreen(context, "Квест больше недоступен. Откройте каталог заново.", mainMenuKeyboard());
           return;
         }
 
         const created = await application.sessions.createSession(
           owner,
-          version.id,
+          quest.id,
           context.update.update_id,
         );
         let started;

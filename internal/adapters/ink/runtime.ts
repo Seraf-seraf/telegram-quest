@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { Story } from "inkjs";
 import type { Choice as InkChoice } from "inkjs/engine/Choice";
 import type { Choice, InkState } from "../../domain/model.js";
@@ -9,19 +8,10 @@ import {
   type StoryStep,
 } from "../../app/story.js";
 
-const SAVED_STATE_FORMAT_VERSION = 1;
-
-interface SavedStateEnvelope {
-  formatVersion: number;
-  storyFingerprint: string;
-  inkStateJson: InkState;
-}
-
 export class InkStoryRuntime implements StoryRuntime {
   public start(compiledStoryJson: string): StoryStep {
     const story = this.createStory(compiledStoryJson);
-    const storyFingerprint = this.fingerprintStory(compiledStoryJson);
-    return this.createStep(story, storyFingerprint, "INVALID_STORY");
+    return this.createStep(story, "INVALID_STORY");
   }
 
   public choose(
@@ -30,12 +20,10 @@ export class InkStoryRuntime implements StoryRuntime {
     choiceIndex: number,
   ): StoryStep {
     const story = this.createStory(compiledStoryJson);
-    const storyFingerprint = this.fingerprintStory(compiledStoryJson);
-    const inkStateJson = this.readSavedState(savedStateJson, storyFingerprint);
-    this.validateInkState(story, inkStateJson);
+    this.validateInkState(story, savedStateJson);
 
     try {
-      story.state.LoadJson(inkStateJson);
+      story.state.LoadJson(savedStateJson);
     } catch {
       throw new StoryRuntimeError("INVALID_STATE", "Saved Ink state is invalid.");
     }
@@ -66,7 +54,7 @@ export class InkStoryRuntime implements StoryRuntime {
       throw new StoryRuntimeError("INVALID_STORY", "The compiled Ink story is invalid.");
     }
 
-    return this.createStep(story, storyFingerprint, "INVALID_STATE");
+    return this.createStep(story, "INVALID_STATE");
   }
 
   private createStory(compiledStoryJson: string): Story {
@@ -79,43 +67,6 @@ export class InkStoryRuntime implements StoryRuntime {
     } catch {
       throw new StoryRuntimeError("INVALID_STORY", "The compiled Ink story is invalid.");
     }
-  }
-
-  private fingerprintStory(compiledStoryJson: string): string {
-    return createHash("sha256")
-      .update(compiledStoryJson.replace(/^\uFEFF/, ""))
-      .digest("hex");
-  }
-
-  private readSavedState(
-    savedStateJson: InkState,
-    expectedStoryFingerprint: string,
-  ): InkState {
-    let envelope: unknown;
-    try {
-      envelope = JSON.parse(savedStateJson);
-    } catch {
-      throw new StoryRuntimeError("INVALID_STATE", "Saved Ink state is invalid.");
-    }
-
-    if (
-      typeof envelope !== "object" ||
-      envelope === null ||
-      Array.isArray(envelope)
-    ) {
-      throw new StoryRuntimeError("INVALID_STATE", "Saved Ink state is invalid.");
-    }
-
-    const stateObject = envelope as Record<string, unknown>;
-    if (
-      stateObject.formatVersion !== SAVED_STATE_FORMAT_VERSION ||
-      stateObject.storyFingerprint !== expectedStoryFingerprint ||
-      typeof stateObject.inkStateJson !== "string"
-    ) {
-      throw new StoryRuntimeError("INVALID_STATE", "Saved Ink state is incompatible.");
-    }
-
-    return stateObject.inkStateJson;
   }
 
   private validateInkState(story: Story, inkStateJson: InkState): void {
@@ -153,7 +104,6 @@ export class InkStoryRuntime implements StoryRuntime {
 
   private createStep(
     story: Story,
-    storyFingerprint: string,
     failureCode: StoryRuntimeErrorCode,
   ): StoryStep {
     const tags: string[] = [];
@@ -186,17 +136,11 @@ export class InkStoryRuntime implements StoryRuntime {
       throw new StoryRuntimeError(failureCode, "The Ink story state could not be saved.");
     }
 
-    const stateJson: InkState = JSON.stringify({
-      formatVersion: SAVED_STATE_FORMAT_VERSION,
-      storyFingerprint,
-      inkStateJson,
-    } satisfies SavedStateEnvelope);
-
     return {
       text,
       choices,
       tags,
-      stateJson,
+      stateJson: inkStateJson,
       ended: choices.length === 0 && !story.canContinue,
     };
   }

@@ -3,8 +3,8 @@ import { createTursoQuestCatalog } from "./adapters/turso/catalog.js";
 import { createTursoDatabase, type TursoDatabase } from "./adapters/turso/client.js";
 import { ensureSchema } from "./adapters/turso/migrate.js";
 import { ensureDemoCatalog } from "./adapters/turso/seed.js";
+import { createTursoStorySource } from "./adapters/turso/story-source.js";
 import { createTursoSessionStore } from "./adapters/turso/store.js";
-import { BundledStorySource } from "./adapters/ink/bundled-story-source.js";
 import { loadStorageConfig } from "./config/env.js";
 import type { QuestCatalog } from "./app/quest-catalog.js";
 import { SessionService } from "./app/sessions.js";
@@ -56,10 +56,10 @@ export async function initializeApp(
     phase = "schema";
     await dependencies.ensureSchema(database);
 
-    const storySource = dependencies.storySource ?? new BundledStorySource();
+    const storySource = dependencies.storySource ?? createTursoStorySource(database);
     if (dependencies.storySource === undefined || dependencies.ensureDemoCatalog !== undefined) {
       phase = "catalog";
-      await (dependencies.ensureDemoCatalog ?? ensureDemoCatalog)(database, storySource);
+      await (dependencies.ensureDemoCatalog ?? ensureDemoCatalog)(database);
     }
 
     const storyRuntime = new InkStoryRuntime();

@@ -6,14 +6,6 @@ export interface Quest {
   available: boolean;
 }
 
-export interface QuestVersion {
-  id: string;
-  questId: string;
-  version: string;
-  storyReference: string;
-  storyHash: string;
-}
-
 export type SessionOwner =
   | { type: "group"; id: string }
   | { type: "user"; id: string };
@@ -44,7 +36,7 @@ export interface Turn {
 
 export interface Session {
   id: string;
-  questVersionId: string;
+  questId: string;
   owner: SessionOwner;
   status: SessionStatus;
   inkState: InkState | null;

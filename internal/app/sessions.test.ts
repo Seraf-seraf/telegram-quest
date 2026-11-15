@@ -1,9 +1,8 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type {
   FinalScene,
-  QuestVersion,
+  Quest,
   Session,
   SessionOwner,
   Turn,
@@ -29,18 +28,14 @@ const compiledStoryJson = readFileSync(
   new URL("../adapters/ink/fixtures/demo.ink.json", import.meta.url),
   "utf8",
 );
-const storyHash = createHash("sha256")
-  .update(compiledStoryJson.replace(/^\uFEFF/, ""))
-  .digest("hex");
-
 const groupOwner: SessionOwner = { type: "group", id: "-100123" };
 const userOwner: SessionOwner = { type: "user", id: "7654321" };
-const questVersion = {
-  id: "quest-version-1",
-  questId: "quest-1",
-  version: "1.0.0",
-  storyReference: "stories/demo.ink.json",
-  storyHash,
+const quest: Quest = {
+  id: "quest-1",
+  title: "Demo quest",
+  description: "A test quest.",
+  genre: "Adventure",
+  available: true,
 };
 
 function makeTurn(overrides: Partial<Turn> = {}): Turn {
@@ -58,7 +53,7 @@ function makeTurn(overrides: Partial<Turn> = {}): Turn {
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: "session-1",
-    questVersionId: questVersion.id,
+    questId: quest.id,
     owner: userOwner,
     status: "created",
     inkState: null,
@@ -88,11 +83,11 @@ function makeActiveSession(owner: SessionOwner = userOwner): Session {
 function makeStore(options: {
   session?: Session;
   questAvailable?: boolean;
-  questVersionExists?: boolean;
+  questExists?: boolean;
   processedOperationIds?: number[];
   ownedSessionsPage?: OwnedSessionPage;
 } = {}): SessionStore & {
-  getQuestVersion: ReturnType<typeof vi.fn>;
+  getQuest: ReturnType<typeof vi.fn>;
   getSession: ReturnType<typeof vi.fn>;
   listOwnedSessions: ReturnType<typeof vi.fn>;
   listTurns: ReturnType<typeof vi.fn>;
@@ -111,15 +106,15 @@ function makeStore(options: {
   const createSession = vi.fn(async (input) => makeSession({
     id: input.sessionId,
     owner: input.owner,
-    questVersionId: input.questVersionId,
+    questId: input.questId,
   }));
-  const getQuestVersion = vi.fn(async (id: string) => {
-    if (options.questVersionExists === false || id !== questVersion.id) {
+  const getQuest = vi.fn(async (id: string) => {
+    if (options.questExists === false || id !== quest.id) {
       return null;
     }
 
     return {
-      questVersion: { ...questVersion },
+      quest: { ...quest },
       questAvailable: options.questAvailable ?? true,
     };
   });
@@ -296,7 +291,7 @@ function makeStore(options: {
 
   return {
     createSession,
-    getQuestVersion,
+    getQuest,
     getSession,
     listOwnedSessions,
     listTurns,
@@ -315,7 +310,7 @@ function makeService(options: {
   store?: SessionStore;
   owner?: SessionOwner;
   questAvailable?: boolean;
-  questVersionExists?: boolean;
+  questExists?: boolean;
   storyRuntime?: StoryRuntime;
   storySource?: StorySource;
   ids?: string[];
@@ -328,13 +323,13 @@ function makeService(options: {
   const store = (options.store as ReturnType<typeof makeStore> | undefined) ?? makeStore({
     session: makeSession({ owner: options.owner ?? userOwner }),
     questAvailable: options.questAvailable,
-    questVersionExists: options.questVersionExists,
+    questExists: options.questExists,
   });
   const runtime = options.storyRuntime ?? new InkStoryRuntime();
   const source = options.storySource ?? {
-    load: vi.fn(async (version: QuestVersion) => {
-      if (version.id !== questVersion.id || version.storyHash !== questVersion.storyHash) {
-        throw new StorySourceError("NOT_FOUND", "Test story version was not found.");
+    load: vi.fn(async (questId: string) => {
+      if (questId !== quest.id) {
+        throw new StorySourceError("NOT_FOUND", "Test quest was not found.");
       }
 
       return compiledStoryJson;
@@ -368,9 +363,8 @@ describe("SessionService", () => {
     const page: OwnedSessionPage = {
       sessions: [{
         id: "session-a",
-        questVersionId: questVersion.id,
+        questId: quest.id,
         questTitle: "The Two Doors",
-        questVersion: "1.0.0",
         status: "active",
         stateVersion: 3,
       }],
@@ -399,12 +393,12 @@ describe("SessionService", () => {
   it("creates a created session without an Ink state", async () => {
     const { service, store } = makeService();
 
-    const session = await service.createSession(userOwner, questVersion.id, 501);
+    const session = await service.createSession(userOwner, quest.id, 501);
 
     expect(session).toMatchObject({
       id: "new-session",
       owner: userOwner,
-      questVersionId: questVersion.id,
+      questId: quest.id,
       status: "created",
       inkState: null,
       stateVersion: 0,
@@ -415,13 +409,13 @@ describe("SessionService", () => {
     expect(store.createSession).toHaveBeenCalledWith({
       sessionId: "new-session",
       owner: userOwner,
-      questVersionId: questVersion.id,
+      questId: quest.id,
       operationId: 501,
       processedAtMs: 1_700_000_000_000,
     });
   });
 
-  it("starts a personal session from its pinned version without timer fields", async () => {
+  it("starts a personal session from its current quest story without timer fields", async () => {
     const runtime = new InkStoryRuntime();
     const choose = vi.spyOn(runtime, "choose");
     const load = vi.fn(async () => compiledStoryJson);
@@ -444,8 +438,7 @@ describe("SessionService", () => {
     expect(store.startSession).toHaveBeenCalledWith(expect.objectContaining({
       kind: "active",
       sessionId: "session-1",
-      questVersionId: questVersion.id,
-      storyHash,
+      questId: quest.id,
       expectedStateVersion: 0,
       initialTurn: expect.objectContaining({
         voteDurationMs: null,
@@ -453,10 +446,10 @@ describe("SessionService", () => {
       }),
     }));
     expect(choose).not.toHaveBeenCalled();
-    expect(load).toHaveBeenCalledWith(questVersion);
+    expect(load).toHaveBeenCalledWith(quest.id);
   });
 
-  it("normalizes a leading BOM before checking the content hash and starting Ink", async () => {
+  it("normalizes a leading BOM before starting Ink", async () => {
     const { service, store } = makeService({
       storySource: {
         load: async () => `\uFEFF${compiledStoryJson.replace(/^\uFEFF/, "")}`,
@@ -469,12 +462,9 @@ describe("SessionService", () => {
     expect(store.startSession).toHaveBeenCalledOnce();
   });
 
-  it("rejects a mismatched version returned by the storage port before loading Ink", async () => {
+  it("rejects a missing quest returned by the storage port before loading Ink", async () => {
     const store = makeStore();
-    store.getQuestVersion.mockResolvedValue({
-      questVersion: { ...questVersion, id: "another-version" },
-      questAvailable: true,
-    });
+    store.getQuest.mockResolvedValue(null);
     const load = vi.fn(async () => compiledStoryJson);
     const runtime: StoryRuntime = {
       start: vi.fn(() => {
@@ -490,40 +480,29 @@ describe("SessionService", () => {
 
     await expectSessionError(
       service.startSession(userOwner, "session-1", 0),
-      "STORY_MISMATCH",
+      "NOT_FOUND",
     );
 
     expect(load).not.toHaveBeenCalled();
     expect(runtime.start).not.toHaveBeenCalled();
   });
 
-  it("does not let StorySource mutate the pinned version hash to select other content", async () => {
+  it("starts the current content returned for the quest without a version hash pin", async () => {
     const alteredStoryJson = compiledStoryJson.replace("two doors", "three doors");
-    const alteredStoryHash = createHash("sha256")
-      .update(alteredStoryJson.replace(/^\uFEFF/, ""))
-      .digest("hex");
-    const store = makeStore();
-    const runtime: StoryRuntime = {
-      start: vi.fn(() => {
-        throw new Error("Ink must not run for substituted content.");
-      }),
-      choose: vi.fn(),
-    };
-    const source: StorySource = {
-      load: async (version) => {
-        version.storyHash = alteredStoryHash;
+    const { service, store } = makeService({
+      storySource: { load: async (questId) => {
+        expect(questId).toBe(quest.id);
         return alteredStoryJson;
-      },
-    };
-    const { service } = makeService({ store, storyRuntime: runtime, storySource: source });
+      } },
+    });
 
-    await expectSessionError(
-      service.startSession(userOwner, "session-1", 0),
-      "STORY_MISMATCH",
-    );
+    const session = await service.startSession(userOwner, "session-1", 0);
 
-    expect(runtime.start).not.toHaveBeenCalled();
-    expect(store.startSession).not.toHaveBeenCalled();
+    expect(session.turns[0]?.sceneText).toContain("three doors");
+    expect(store.startSession).toHaveBeenCalledWith(expect.objectContaining({
+      questId: quest.id,
+      kind: "active",
+    }));
   });
 
   it("requires a valid group policy for an open group turn", async () => {
@@ -575,29 +554,6 @@ describe("SessionService", () => {
     );
   });
 
-  it("checks the stored content hash before executing Ink", async () => {
-    const runtime = {
-      start: vi.fn(() => {
-        throw new Error("Ink must not run for mismatched content.");
-      }),
-      choose: vi.fn(),
-    } satisfies StoryRuntime;
-    const alteredSource: StorySource = {
-      load: async () => compiledStoryJson.replace("two doors", "three doors"),
-    };
-    const { service, store } = makeService({
-      storyRuntime: runtime,
-      storySource: alteredSource,
-    });
-
-    await expectSessionError(
-      service.startSession(userOwner, "session-1", 0),
-      "STORY_MISMATCH",
-    );
-    expect(runtime.start).not.toHaveBeenCalled();
-    expect(store.startSession).not.toHaveBeenCalled();
-  });
-
   it("rejects a malformed Ink checkpoint before changing session state", async () => {
     const runtime: StoryRuntime = {
       start: vi.fn(() => ({
@@ -619,7 +575,7 @@ describe("SessionService", () => {
     expect(store.startSession).not.toHaveBeenCalled();
   });
 
-  it("rejects an unavailable or missing quest version before loading its story", async () => {
+  it("rejects an unavailable or missing quest before loading its story", async () => {
     const unavailable = makeService({ owner: userOwner, questAvailable: false });
     await expectSessionError(
       unavailable.service.startSession(userOwner, "session-1", 0),
@@ -627,7 +583,7 @@ describe("SessionService", () => {
     );
     expect(unavailable.source.load).not.toHaveBeenCalled();
 
-    const missing = makeService({ owner: userOwner, questVersionExists: false });
+    const missing = makeService({ owner: userOwner, questExists: false });
     await expectSessionError(
       missing.service.startSession(userOwner, "session-1", 0),
       "NOT_FOUND",
@@ -667,8 +623,7 @@ describe("SessionService", () => {
       kind: "completed",
       sessionId: "session-1",
       owner: groupOwner,
-      questVersionId: questVersion.id,
-      storyHash,
+      questId: quest.id,
       expectedStateVersion: 0,
       inkState: "{\"terminal\":true}",
       finalScene: { text: terminalStep.text, tags: terminalStep.tags },
@@ -1009,8 +964,7 @@ describe("SessionService", () => {
     expect(store.restartSession).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: session.id,
       expectedStateVersion: session.stateVersion,
-      questVersionId: session.questVersionId,
-      storyHash,
+      questId: session.questId,
     }));
   });
 

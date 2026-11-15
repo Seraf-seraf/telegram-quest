@@ -1,6 +1,6 @@
 import type {
   FinalScene,
-  QuestVersion,
+  Quest,
   Session,
   SessionOwner,
   SessionStatus,
@@ -28,16 +28,15 @@ export class SessionError extends Error {
   }
 }
 
-export interface SessionQuestVersion {
-  questVersion: QuestVersion;
+export interface SessionQuest {
+  quest: Quest;
   questAvailable: boolean;
 }
 
 export interface OwnedSessionSummary {
   id: string;
-  questVersionId: string;
+  questId: string;
   questTitle: string;
-  questVersion: string;
   status: SessionStatus;
   stateVersion: number;
 }
@@ -50,7 +49,7 @@ export interface OwnedSessionPage {
 export interface CreateSessionRecord {
   sessionId: string;
   owner: SessionOwner;
-  questVersionId: string;
+  questId: string;
   operationId: number;
   processedAtMs: number;
 }
@@ -65,8 +64,7 @@ export interface ActiveSessionStart {
   kind: "active";
   sessionId: string;
   owner: SessionOwner;
-  questVersionId: string;
-  storyHash: string;
+  questId: string;
   expectedStateVersion: number;
   inkState: string;
   initialTurn: InitialTurnRecord;
@@ -76,8 +74,7 @@ export interface CompletedSessionStart {
   kind: "completed";
   sessionId: string;
   owner: SessionOwner;
-  questVersionId: string;
-  storyHash: string;
+  questId: string;
   expectedStateVersion: number;
   inkState: string;
   finalScene: FinalScene;
@@ -98,8 +95,7 @@ export interface CompletedDecisionResult {
 export interface ApplyDecisionRecord {
   sessionId: string;
   owner: SessionOwner;
-  questVersionId: string;
-  storyHash: string;
+  questId: string;
   expectedStateVersion: number;
   turnId: string;
   choiceIndex: number;
@@ -131,7 +127,7 @@ export interface RewindSessionRecord extends SessionTransitionRecord {
 export interface SessionStore {
   /** Atomically records the operation and inserts a created session. */
   createSession(input: CreateSessionRecord): Promise<Session>;
-  getQuestVersion(questVersionId: string): Promise<SessionQuestVersion | null>;
+  getQuest(questId: string): Promise<SessionQuest | null>;
   /** Returns the session and its single current open turn, without loading history. */
   getSession(owner: SessionOwner, sessionId: string): Promise<Session>;
   /** Returns a bounded, owner-filtered page of session metadata without loading turns. */
@@ -141,7 +137,7 @@ export interface SessionStore {
     cursor: string | null,
   ): Promise<OwnedSessionPage>;
   listTurns(owner: SessionOwner, sessionId: string): Promise<Turn[]>;
-  /** Compares owner, pinned version and state version, then persists state and the first turn atomically. */
+  /** Compares owner, quest and state version, then persists state and the first turn atomically. */
   startSession(input: StartSessionRecord): Promise<Session>;
   /** Checks the globally unique Telegram update ID before an ambiguous decision is retried. */
   hasProcessedOperation(operationId: number): Promise<boolean>;
@@ -153,7 +149,7 @@ export interface SessionStore {
   resumeSession(input: ResumeSessionRecord): Promise<Session>;
   /** Completes the session with stopped_by_owner and stops any current timer. */
   stopSession(input: SessionTransitionRecord): Promise<Session>;
-  /** Destructively replaces all prior turns with a new run on the same pinned quest version. */
+  /** Destructively replaces all prior turns with a new run of the same quest. */
   restartSession(input: StartSessionRecord): Promise<Session>;
   /** Replaces the target turn and later history with a fresh turn at its saved Ink checkpoint. */
   rewindSession(input: RewindSessionRecord): Promise<Session>;

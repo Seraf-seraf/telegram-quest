@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
   Choice,
   Session,
@@ -143,17 +143,17 @@ export class SessionService {
 
   public async createSession(
     owner: SessionOwner,
-    questVersionId: string,
+    questId: string,
     operationId: number,
   ): Promise<Session> {
     assertOwner(owner);
 
     if (
-      typeof questVersionId !== "string" ||
-      questVersionId.length === 0 ||
-      questVersionId.trim() !== questVersionId
+      typeof questId !== "string" ||
+      questId.length === 0 ||
+      questId.trim() !== questId
     ) {
-      throw new SessionError("NOT_FOUND", "Quest version was not found.");
+      throw new SessionError("NOT_FOUND", "Quest was not found.");
     }
 
     assertNonNegativeSafeInteger(operationId, "Operation ID");
@@ -163,7 +163,7 @@ export class SessionService {
     return this.store.createSession({
       sessionId,
       owner,
-      questVersionId,
+      questId,
       operationId,
       processedAtMs,
     });
@@ -187,12 +187,12 @@ export class SessionService {
       throw new SessionError("INVALID_TRANSITION", "Session cannot be started.");
     }
 
-    const pinnedStory = await this.loadPinnedStory(session.questVersionId, true);
+    const story = await this.loadQuestStory(session.questId, true);
 
     let step: StoryStep;
 
     try {
-      step = this.storyRuntime.start(pinnedStory.compiledStoryJson);
+      step = this.storyRuntime.start(story.compiledStoryJson);
     } catch (error) {
       const message = error instanceof StoryRuntimeError && error.code === "INVALID_STORY"
         ? "Quest story is not a valid compiled Ink story."
@@ -211,8 +211,7 @@ export class SessionService {
         kind: "completed",
         sessionId,
         owner,
-        questVersionId: session.questVersionId,
-        storyHash: pinnedStory.storyHash,
+        questId: session.questId,
         expectedStateVersion,
         inkState: step.stateJson,
         finalScene: { text: step.text, tags: [...step.tags] },
@@ -225,8 +224,7 @@ export class SessionService {
       kind: "active",
       sessionId,
       owner,
-      questVersionId: session.questVersionId,
-      storyHash: pinnedStory.storyHash,
+      questId: session.questId,
       expectedStateVersion,
       inkState: step.stateJson,
       initialTurn,
@@ -297,12 +295,12 @@ export class SessionService {
       throw new SessionError("INVALID_CHOICE", "Choice is not available.");
     }
 
-    const pinnedStory = await this.loadPinnedStory(session.questVersionId, false);
+    const story = await this.loadQuestStory(session.questId, false);
     let step: StoryStep;
 
     try {
       step = this.storyRuntime.choose(
-        pinnedStory.compiledStoryJson,
+        story.compiledStoryJson,
         currentTurn.inkCheckpoint,
         choiceIndex,
       );
@@ -395,8 +393,7 @@ export class SessionService {
     return this.store.applyDecision({
       sessionId,
       owner,
-      questVersionId: session.questVersionId,
-      storyHash: pinnedStory.storyHash,
+      questId: session.questId,
       expectedStateVersion,
       turnId,
       choiceIndex,
@@ -465,10 +462,10 @@ export class SessionService {
       throw new SessionError("INVALID_TRANSITION", "Restart requires explicit confirmation.");
     }
 
-    const pinnedStory = await this.loadPinnedStory(session.questVersionId, true);
+    const story = await this.loadQuestStory(session.questId, true);
     let step: StoryStep;
     try {
-      step = this.storyRuntime.start(pinnedStory.compiledStoryJson);
+      step = this.storyRuntime.start(story.compiledStoryJson);
     } catch (error) {
       const message = error instanceof StoryRuntimeError && error.code === "INVALID_STORY"
         ? "Quest story is not a valid compiled Ink story."
@@ -487,8 +484,7 @@ export class SessionService {
         kind: "completed",
         sessionId,
         owner,
-        questVersionId: session.questVersionId,
-        storyHash: pinnedStory.storyHash,
+        questId: session.questId,
         expectedStateVersion,
         inkState: step.stateJson,
         finalScene: { text: step.text, tags: [...step.tags] },
@@ -498,8 +494,7 @@ export class SessionService {
         kind: "active",
         sessionId,
         owner,
-        questVersionId: session.questVersionId,
-        storyHash: pinnedStory.storyHash,
+        questId: session.questId,
         expectedStateVersion,
         inkState: step.stateJson,
         initialTurn: this.createInitialTurn(owner, step, groupPolicy),
@@ -633,32 +628,23 @@ export class SessionService {
     };
   }
 
-  private async loadPinnedStory(
-    questVersionId: string,
+  private async loadQuestStory(
+    questId: string,
     requireAvailable: boolean,
-  ): Promise<{ compiledStoryJson: string; storyHash: string }> {
-    const versionDetails = await this.store.getQuestVersion(questVersionId);
+  ): Promise<{ compiledStoryJson: string }> {
+    const questDetails = await this.store.getQuest(questId);
 
-    if (versionDetails === null) {
-      throw new SessionError("NOT_FOUND", "Quest version was not found.");
+    if (questDetails === null) {
+      throw new SessionError("NOT_FOUND", "Quest was not found.");
     }
 
-    if (versionDetails.questVersion.id !== questVersionId) {
-      throw new SessionError("STORY_MISMATCH", "Session is pinned to another quest version.");
-    }
-
-    if (requireAvailable && !versionDetails.questAvailable) {
+    if (requireAvailable && !questDetails.questAvailable) {
       throw new SessionError("INVALID_TRANSITION", "Quest is not available.");
-    }
-
-    const pinnedStoryHash = versionDetails.questVersion.storyHash;
-    if (!/^[a-f\d]{64}$/i.test(pinnedStoryHash)) {
-      throw new SessionError("STORY_MISMATCH", "Quest version has an invalid content hash.");
     }
 
     let compiledStoryJson: string;
     try {
-      compiledStoryJson = await this.storySource.load({ ...versionDetails.questVersion });
+      compiledStoryJson = await this.storySource.load(questId);
     } catch (error) {
       if (error instanceof StorySourceError) {
         throw new SessionError(error.code, "Quest story could not be loaded.", { cause: error });
@@ -674,11 +660,6 @@ export class SessionService {
     }
 
     compiledStoryJson = compiledStoryJson.replace(/^\uFEFF/, "");
-    const actualStoryHash = createHash("sha256").update(compiledStoryJson).digest("hex");
-    if (actualStoryHash !== pinnedStoryHash.toLowerCase()) {
-      throw new SessionError("STORY_MISMATCH", "Quest story does not match its stored version.");
-    }
-
-    return { compiledStoryJson, storyHash: pinnedStoryHash };
+    return { compiledStoryJson };
   }
 }

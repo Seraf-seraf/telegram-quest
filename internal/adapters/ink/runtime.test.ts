@@ -52,11 +52,6 @@ function expectStoryError(
   expect(thrownError).toMatchObject({ code });
 }
 
-function inkStateFromEnvelope(stateJson: string): string {
-  const envelope = JSON.parse(stateJson) as { inkStateJson: string };
-  return envelope.inkStateJson;
-}
-
 describe("InkStoryRuntime", (): void => {
   it("starts the compiled story with tagged choices", (): void => {
     const runtime = new InkStoryRuntime();
@@ -69,6 +64,7 @@ describe("InkStoryRuntime", (): void => {
       { index: 1, text: "Take the right path", tags: ["direction:right"] },
     ]);
     expect(step.stateJson).toEqual(expect.any(String));
+    expect(JSON.parse(step.stateJson)).not.toHaveProperty("storyFingerprint");
     expect(step.ended).toBe(false);
   });
 
@@ -112,7 +108,7 @@ describe("InkStoryRuntime", (): void => {
     const initial = new InkStoryRuntime().start(compiledStoryJson);
     const originalStateJson = initial.stateJson;
     const uninterrupted = new Story(compiledStoryJson.replace(/^\uFEFF/, ""));
-    uninterrupted.state.LoadJson(inkStateFromEnvelope(initial.stateJson));
+    uninterrupted.state.LoadJson(initial.stateJson);
     uninterrupted.ChooseChoiceIndex(0);
     const expectedBranch = readInkStep(uninterrupted);
 
@@ -133,7 +129,7 @@ describe("InkStoryRuntime", (): void => {
       tags: expectedBranch.tags,
       ended: expectedBranch.ended,
     });
-    expect(JSON.parse(inkStateFromEnvelope(branch.stateJson))).toEqual(
+    expect(JSON.parse(branch.stateJson)).toEqual(
       JSON.parse(expectedBranch.stateJson),
     );
     expect(repeatedBranch).toEqual(branch);
@@ -153,7 +149,7 @@ describe("InkStoryRuntime", (): void => {
       tags: expectedEnding.tags,
       ended: expectedEnding.ended,
     });
-    expect(JSON.parse(inkStateFromEnvelope(ending.stateJson))).toEqual(
+    expect(JSON.parse(ending.stateJson)).toEqual(
       JSON.parse(expectedEnding.stateJson),
     );
   });
@@ -161,15 +157,7 @@ describe("InkStoryRuntime", (): void => {
   it("rejects malformed and incompatible story state", (): void => {
     const runtime = new InkStoryRuntime();
     const initial = runtime.start(compiledStoryJson);
-    const stateEnvelope = JSON.parse(initial.stateJson) as {
-      formatVersion: number;
-      storyFingerprint: string;
-      inkStateJson: string;
-    };
-    const incompatibleInkState = JSON.parse(stateEnvelope.inkStateJson) as Record<
-      string,
-      unknown
-    >;
+    const incompatibleInkState = JSON.parse(initial.stateJson) as Record<string, unknown>;
     incompatibleInkState.inkSaveVersion = 999;
 
     expectStoryError(() => runtime.start("not JSON"), "INVALID_STORY");
@@ -180,17 +168,14 @@ describe("InkStoryRuntime", (): void => {
     expectStoryError(
       () => runtime.choose(
         compiledStoryJson,
-        JSON.stringify({
-          ...stateEnvelope,
-          inkStateJson: JSON.stringify(incompatibleInkState),
-        }),
+        JSON.stringify(incompatibleInkState),
         0,
       ),
       "INVALID_STATE",
     );
   });
 
-  it("rejects state created for different compiled story content", (): void => {
+  it("lets Ink validate saved states without an application story fingerprint", (): void => {
     const runtime = new InkStoryRuntime();
     const initial = runtime.start(compiledStoryJson);
     const changedStoryJson = compiledStoryJson.replace(
@@ -199,10 +184,8 @@ describe("InkStoryRuntime", (): void => {
     );
 
     expect(changedStoryJson).not.toBe(compiledStoryJson);
-    expectStoryError(
-      () => runtime.choose(changedStoryJson, initial.stateJson, 0),
-      "INVALID_STATE",
-    );
+    const step = runtime.choose(changedStoryJson, initial.stateJson, 0);
+    expect(step.text).toContain("A changed left path glows.");
   });
 
   it("rejects unavailable and non-integer choice indexes", (): void => {

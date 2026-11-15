@@ -344,16 +344,10 @@ describe("private quest Telegram handlers", () => {
       buttonData(telegram.calls, "Две двери"),
     ));
     await bot.handleUpdate(callbackUpdate(
-      4,
-      privateUserId,
-      messageId,
-      buttonData(telegram.calls, "Версия 1.0.0"),
-    ));
-    await bot.handleUpdate(callbackUpdate(
       5,
       privateUserId,
       messageId,
-      buttonData(telegram.calls, "Начать"),
+      buttonData(telegram.calls, "Начать прохождение"),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
 
@@ -378,16 +372,10 @@ describe("private quest Telegram handlers", () => {
       buttonData(telegram.calls, "Две двери"),
     ));
     await bot.handleUpdate(callbackUpdate(
-      8,
-      privateUserId,
-      messageId,
-      buttonData(telegram.calls, "Версия 1.0.0"),
-    ));
-    await bot.handleUpdate(callbackUpdate(
       9,
       privateUserId,
       messageId,
-      buttonData(telegram.calls, "Начать"),
+      buttonData(telegram.calls, "Начать прохождение"),
     ));
     expect((await app.sessions.listOwnedSessions(
       { type: "user", id: String(privateUserId) },
@@ -422,7 +410,7 @@ describe("private quest Telegram handlers", () => {
       12,
       privateUserId,
       latestMessageId(telegram.calls),
-      buttonData(telegram.calls, "Две двери · 1.0.0 · в процессе"),
+      buttonData(telegram.calls, "Две двери · в процессе"),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
 
@@ -459,8 +447,10 @@ describe("private quest Telegram handlers", () => {
       2,
       privateUserId,
       1,
-      encodePrivateQuestCallback({ kind: "start", versionId: "missing-version" }),
+      "v1:s:bWlzc2luZy12ZXJzaW9u",
     ));
+    expect(telegram.calls.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text)
+      .toBe("Меню обновилось. Откройте /menu");
     expect((await app.sessions.listOwnedSessions(
       { type: "user", id: String(privateUserId) },
       20,
@@ -501,8 +491,7 @@ describe("private quest Telegram handlers", () => {
     const getApplication = vi.fn(async () => ({
       catalog: {
         listAvailableQuests: vi.fn(async () => []),
-        listVersions: app.catalog.listVersions.bind(app.catalog),
-        getQuestVersion: app.catalog.getQuestVersion.bind(app.catalog),
+        getQuest: app.catalog.getQuest.bind(app.catalog),
       },
       sessions: app.sessions,
     }));
@@ -543,12 +532,6 @@ describe("private quest Telegram handlers", () => {
         panelMessageId,
         buttonData(telegram.calls, "Две двери"),
       ));
-      await bot.handleUpdate(callbackUpdate(
-        firstUpdateId + 2,
-        userId,
-        panelMessageId,
-        buttonData(telegram.calls, "Версия 1.0.0"),
-      ));
       if (failSceneSend) {
         telegram.failNext("sendMessage");
       }
@@ -556,7 +539,7 @@ describe("private quest Telegram handlers", () => {
         firstUpdateId + 3,
         userId,
         panelMessageId,
-        buttonData(telegram.calls, "Начать"),
+        buttonData(telegram.calls, "Начать прохождение"),
       ));
       const screen = latestScreen(telegram.calls);
       return {
@@ -588,7 +571,7 @@ describe("private quest Telegram handlers", () => {
       105,
       privateUserId,
       sessionsPanelId,
-      buttonData(telegram.calls, "Две двери · 1.0.0 · в процессе"),
+      buttonData(telegram.calls, "Две двери · в процессе"),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
     const firstSessionId = (await application.sessions.listOwnedSessions(
@@ -637,7 +620,7 @@ describe("private quest Telegram handlers", () => {
       108,
       privateUserId,
       restartedSessionsPanelId,
-      buttonData(telegram.calls, "Две двери · 1.0.0 · в процессе"),
+      buttonData(telegram.calls, "Две двери · в процессе"),
     ));
     expect(latestScreen(telegram.calls).payload.text).toContain("The left path glows.");
     const secondSceneMessageId = latestMessageId(telegram.calls);
@@ -773,8 +756,7 @@ describe("private quest Telegram handlers", () => {
     }
 
     await clickPanel("Две двери");
-    await clickPanel("Версия 1.0.0");
-    await clickPanel("Начать");
+    await clickPanel("Начать прохождение");
     expect(storyStart).toHaveBeenCalledTimes(1);
 
     const session = (await app.sessions.listOwnedSessions(

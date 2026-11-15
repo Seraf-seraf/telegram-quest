@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -29,18 +28,11 @@ const compiledStoryJson = readFileSync(
   new URL("../ink/fixtures/demo.ink.json", import.meta.url),
   "utf8",
 );
-const storyHash = createHash("sha256")
-  .update(compiledStoryJson.replace(/^\uFEFF/, ""))
-  .digest("hex");
 const LOCAL_SQLITE_TEST_TIMEOUT_MS = 15_000;
 const source: StorySource = {
-  load: async (version) => {
-    if (
-      version.id !== "quest-version-1" ||
-      version.storyReference !== "stories/demo.ink.json" ||
-      version.storyHash !== storyHash
-    ) {
-      throw new StorySourceError("NOT_FOUND", "Pinned test story was not found.");
+  load: async (questId) => {
+    if (questId !== "quest-1") {
+      throw new StorySourceError("NOT_FOUND", "Test quest story was not found.");
     }
 
     return compiledStoryJson;
@@ -190,22 +182,14 @@ async function createTemporaryDatabase(): Promise<{
 async function seedQuest(database: TursoDatabase, available: boolean = true): Promise<void> {
   await database.write(async (executor) => {
     await executor.run(
-      `INSERT INTO quest (id, title, description, genre, available)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO quest (id, title, description, genre, available, story_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       "quest-1",
       "The Two Doors",
       "A compact test quest.",
       "adventure",
       available ? 1 : 0,
-    );
-    await executor.run(
-      `INSERT INTO quest_version (id, quest_id, version, story_ref, story_hash)
-       VALUES (?, ?, ?, ?, ?)`,
-      "quest-version-1",
-      "quest-1",
-      "1.0.0",
-      "stories/demo.ink.json",
-      storyHash,
+      compiledStoryJson.replace(/^\uFEFF/, ""),
     );
   });
 }
@@ -324,28 +308,26 @@ describe("Turso session store with local libSQL", () => {
     const service = makeService(database, {
       ids: ["session-a", "session-b", "session-c", "session-d", "session-e"],
     });
-    await service.createSession(userOwner, "quest-version-1", 701);
-    await service.createSession(userOwner, "quest-version-1", 702);
-    await service.createSession(userOwner, "quest-version-1", 703);
-    await service.createSession(groupOwner, "quest-version-1", 704);
-    await service.createSession({ type: "user", id: "42" }, "quest-version-1", 705);
+    await service.createSession(userOwner, "quest-1", 701);
+    await service.createSession(userOwner, "quest-1", 702);
+    await service.createSession(userOwner, "quest-1", 703);
+    await service.createSession(groupOwner, "quest-1", 704);
+    await service.createSession({ type: "user", id: "42" }, "quest-1", 705);
 
     const store = createTursoSessionStore(database);
     const firstPage = await store.listOwnedSessions(userOwner, 2, null);
     expect(firstPage.sessions).toEqual([
       {
         id: "session-a",
-        questVersionId: "quest-version-1",
+        questId: "quest-1",
         questTitle: "The Two Doors",
-        questVersion: "1.0.0",
         status: "created",
         stateVersion: 0,
       },
       {
         id: "session-b",
-        questVersionId: "quest-version-1",
+        questId: "quest-1",
         questTitle: "The Two Doors",
-        questVersion: "1.0.0",
         status: "created",
         stateVersion: 0,
       },
@@ -370,7 +352,7 @@ describe("Turso session store with local libSQL", () => {
     await seedQuest(firstDatabase);
 
     const firstService = requireSessions(firstApp);
-    const created = await firstService.createSession(userOwner, "quest-version-1", 101);
+    const created = await firstService.createSession(userOwner, "quest-1", 101);
     const started = await firstService.startSession(userOwner, created.id, 0);
 
     expect(started).toMatchObject({
@@ -390,7 +372,7 @@ describe("Turso session store with local libSQL", () => {
       default_choice_index: null,
     });
 
-    const groupCreated = await firstService.createSession(groupOwner, "quest-version-1", 102);
+    const groupCreated = await firstService.createSession(groupOwner, "quest-1", 102);
     const groupStarted = await firstService.startSession(groupOwner, groupCreated.id, 0, {
       voteDurationMs: 60_000,
       defaultChoiceIndex: 1,
@@ -456,22 +438,22 @@ describe("Turso session store with local libSQL", () => {
       },
     });
 
-    const firstGroupSession = await service.createSession(groupOwner, "quest-version-1", 201);
+    const firstGroupSession = await service.createSession(groupOwner, "quest-1", 201);
     await expectSessionError(
-      service.createSession(groupOwner, "quest-version-1", 202),
+      service.createSession(groupOwner, "quest-1", 202),
       "CONFLICT",
     );
     expect(await processedUpdateCount(database, 202)).toBe(0);
 
     await service.startSession(groupOwner, firstGroupSession.id, 0);
-    const replacementGroupSession = await service.createSession(groupOwner, "quest-version-1", 203);
+    const replacementGroupSession = await service.createSession(groupOwner, "quest-1", 203);
     const secondGroupSession = await service.createSession(
       { type: "group", id: "-100999" },
-      "quest-version-1",
+      "quest-1",
       204,
     );
-    const sameNumericIdUserSession = await service.createSession(userOwner, "quest-version-1", 205);
-    const anotherUserSession = await service.createSession(userOwner, "quest-version-1", 206);
+    const sameNumericIdUserSession = await service.createSession(userOwner, "quest-1", 205);
+    const anotherUserSession = await service.createSession(userOwner, "quest-1", 206);
 
     expect(firstGroupSession.status).toBe("created");
     expect(replacementGroupSession.status).toBe("created");
@@ -479,7 +461,7 @@ describe("Turso session store with local libSQL", () => {
     expect(sameNumericIdUserSession.owner).toEqual(userOwner);
     expect(anotherUserSession.owner).toEqual(userOwner);
     await expectSessionError(
-      service.createSession({ type: "user", id: "another-user" }, "quest-version-1", 201),
+      service.createSession({ type: "user", id: "another-user" }, "quest-1", 201),
       "DUPLICATE_OPERATION",
     );
 
@@ -506,7 +488,7 @@ describe("Turso session store with local libSQL", () => {
         choose: vi.fn(),
       },
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 301);
+    const created = await service.createSession(userOwner, "quest-1", 301);
 
     const completed = await service.startSession(userOwner, created.id, 0);
 
@@ -537,11 +519,11 @@ describe("Turso session store with local libSQL", () => {
       ],
     });
 
-    const leftCreated = await service.createSession(userOwner, "quest-version-1", 601);
+    const leftCreated = await service.createSession(userOwner, "quest-1", 601);
     const leftStarted = await service.startSession(userOwner, leftCreated.id, 0);
     const rightCreated = await service.createSession(
       { type: "user", id: "42" },
-      "quest-version-1",
+      "quest-1",
       602,
     );
     const rightStarted = await service.startSession(
@@ -657,7 +639,7 @@ describe("Turso session store with local libSQL", () => {
       store,
       ids: ["concurrent-session", "concurrent-turn", "concurrent-next-turn"],
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 701);
+    const created = await service.createSession(userOwner, "quest-1", 701);
     const started = await service.startSession(userOwner, created.id, 0);
     const turnId = started.turns[0]!.id;
 
@@ -698,7 +680,7 @@ describe("Turso session store with local libSQL", () => {
     const service = makeService(database, {
       ids: ["rollback-session", "rollback-turn", "rollback-turn"],
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 801);
+    const created = await service.createSession(userOwner, "quest-1", 801);
     const started = await service.startSession(userOwner, created.id, 0);
 
     await expectSessionError(
@@ -736,7 +718,7 @@ describe("Turso session store with local libSQL", () => {
       ids: ["paused-session", "paused-turn", "untimed-session", "untimed-turn"],
       now: () => 1_500,
     });
-    const timedCreated = await firstService.createSession(firstGroup, "quest-version-1", 901);
+    const timedCreated = await firstService.createSession(firstGroup, "quest-1", 901);
     const timedStarted = await firstService.startSession(firstGroup, timedCreated.id, 0, {
       voteDurationMs: 60_000,
       defaultChoiceIndex: 0,
@@ -769,7 +751,7 @@ describe("Turso session store with local libSQL", () => {
       "INVALID_TRANSITION",
     );
 
-    const untimedCreated = await firstService.createSession(secondGroup, "quest-version-1", 903);
+    const untimedCreated = await firstService.createSession(secondGroup, "quest-1", 903);
     const untimedStarted = await firstService.startSession(secondGroup, untimedCreated.id, 0, {
       voteDurationMs: 60_000,
       defaultChoiceIndex: 1,
@@ -843,7 +825,7 @@ describe("Turso session store with local libSQL", () => {
         "fresh-turn-2",
       ],
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 1_001);
+    const created = await service.createSession(userOwner, "quest-1", 1_001);
     const stoppedCreated = await service.stopSession(userOwner, created.id, 0);
     expect(stoppedCreated).toMatchObject({
       status: "completed",
@@ -853,7 +835,7 @@ describe("Turso session store with local libSQL", () => {
       turns: [],
     });
 
-    const restartCreated = await service.createSession(group, "quest-version-1", 1_002);
+    const restartCreated = await service.createSession(group, "quest-1", 1_002);
     const started = await service.startSession(group, restartCreated.id, 0, {
       voteDurationMs: 30_000,
       defaultChoiceIndex: 0,
@@ -874,7 +856,7 @@ describe("Turso session store with local libSQL", () => {
     const newTurnId = restarted.turns[0]!.id;
     expect(restarted).toMatchObject({
       id: restartCreated.id,
-      questVersionId: "quest-version-1",
+      questId: "quest-1",
       status: "active",
       stateVersion: 2,
       turns: [{ stepNumber: 1, decision: null }],
@@ -934,7 +916,7 @@ describe("Turso session store with local libSQL", () => {
         "replacement-turn-2",
       ],
     });
-    const created = await service.createSession(group, "quest-version-1", 1_101);
+    const created = await service.createSession(group, "quest-1", 1_101);
     const started = await service.startSession(group, created.id, 0, {
       voteDurationMs: 60_000,
       defaultChoiceIndex: 1,
@@ -1056,13 +1038,13 @@ describe("Turso session store with local libSQL", () => {
     const firstService = makeService(database, {
       ids: ["first-session", "shared-turn-id"],
     });
-    const firstSession = await firstService.createSession(userOwner, "quest-version-1", 350);
+    const firstSession = await firstService.createSession(userOwner, "quest-1", 350);
     await firstService.startSession(userOwner, firstSession.id, 0);
 
     const secondService = makeService(database, {
       ids: ["second-session", "shared-turn-id"],
     });
-    const secondSession = await secondService.createSession(userOwner, "quest-version-1", 351);
+    const secondSession = await secondService.createSession(userOwner, "quest-1", 351);
 
     await expectSessionError(
       secondService.startSession(userOwner, secondSession.id, 0),
@@ -1079,41 +1061,30 @@ describe("Turso session store with local libSQL", () => {
     database.close();
   }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
 
-  it("does not activate a session when its pinned version hash changes during story loading", async () => {
+  it("loads the current story by quest ID without checking a story fingerprint", async () => {
     const temporary = await createTemporaryDatabase();
     cleanupDirectories.push(temporary.directory);
     const database = temporary.database;
     await ensureSchema(database);
     await seedQuest(database);
-    const changedHash = storyHash === "a".repeat(64) ? "b".repeat(64) : "a".repeat(64);
+    const load = vi.fn(async (questId: string): Promise<string> => {
+      expect(questId).toBe("quest-1");
+      return compiledStoryJson;
+    });
     const changingSource: StorySource = {
-      load: async () => {
-        await database.write((executor) => executor.run(
-          "UPDATE quest_version SET story_hash = ? WHERE id = ?",
-          changedHash,
-          "quest-version-1",
-        ));
-        return compiledStoryJson;
-      },
+      load,
     };
     const service = makeService(database, {
-      ids: ["version-race-session"],
+      ids: ["current-story-session", "current-story-turn"],
       source: changingSource,
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 401);
+    const created = await service.createSession(userOwner, "quest-1", 401);
 
-    await expectSessionError(
-      service.startSession(userOwner, created.id, 0),
-      "STORY_MISMATCH",
-    );
+    const started = await service.startSession(userOwner, created.id, 0);
 
-    const unchanged = await service.getSession(userOwner, created.id);
-    expect(unchanged).toMatchObject({
-      status: "created",
-      stateVersion: 0,
-      inkState: null,
-      turns: [],
-    });
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledWith("quest-1");
+    expect(started).toMatchObject({ id: created.id, status: "active", stateVersion: 1 });
     database.close();
   }, LOCAL_SQLITE_TEST_TIMEOUT_MS);
 
@@ -1136,7 +1107,7 @@ describe("Turso session store with local libSQL", () => {
       ids: ["availability-race-session"],
       source: changingSource,
     });
-    const created = await service.createSession(userOwner, "quest-version-1", 402);
+    const created = await service.createSession(userOwner, "quest-1", 402);
 
     await expectSessionError(
       service.startSession(userOwner, created.id, 0),

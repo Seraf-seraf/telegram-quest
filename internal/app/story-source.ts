@@ -1,5 +1,3 @@
-import type { QuestVersion } from "../domain/model.js";
-
 export type StorySourceErrorCode = "NOT_FOUND" | "STORAGE_FAILURE";
 
 export class StorySourceError extends Error {
@@ -14,5 +12,5 @@ export class StorySourceError extends Error {
 }
 
 export interface StorySource {
-  load(questVersion: QuestVersion): Promise<string>;
+  load(questId: string): Promise<string>;
 }
