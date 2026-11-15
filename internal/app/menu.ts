@@ -72,7 +72,7 @@ function view(text: string, rows: MenuButton[][]): MenuView {
 }
 
 export function mainMenuView(): MenuView {
-  return view("Telegram Quest\nЛичный интерактивный рассказ. Выберите раздел.", [
+  return view("Telegram Quest\nВыбирай квест, принимай решения и смотри, куда заведёт история. Тут финал зависит от тебя.", [
     [{ text: "📚 Квесты", action: { kind: "quests_page", page: 1, genreKey: null, genrePage: 1 } }],
     [{ text: "🎭 Жанры", action: { kind: "genres_page", page: 1 } }],
     [{ text: "📖 Мои прохождения", action: { kind: "sessions_page", page: 1 } }],

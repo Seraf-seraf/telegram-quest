@@ -357,7 +357,7 @@ describe("private quest Telegram handlers", () => {
     registerPrivateQuestHandlers(bot, getApplication, (event) => failures.push(event));
 
     await bot.handleUpdate(commandUpdate(1, privateUserId, "/start"));
-    expect(latestScreen(telegram.calls).payload.text).toBe("Telegram Quest\nЛичный интерактивный рассказ. Выберите раздел.");
+    expect(latestScreen(telegram.calls).payload.text).toBe("Telegram Quest\nВыбирай квест, принимай решения и смотри, куда заведёт история. Тут финал зависит от тебя.");
     let messageId = latestMessageId(telegram.calls);
 
     await bot.handleUpdate(callbackUpdate(
@@ -723,7 +723,7 @@ describe("private quest Telegram handlers", () => {
 
     await bot.handleUpdate(commandUpdate(1, privateUserId, "/start"));
     expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/main.jpg");
-    expect(latestScreen(telegram.calls).payload.caption).toBe("Telegram Quest\nЛичный интерактивный рассказ. Выберите раздел.");
+    expect(latestScreen(telegram.calls).payload.caption).toBe("Telegram Quest\nВыбирай квест, принимай решения и смотри, куда заведёт история. Тут финал зависит от тебя.");
 
     await bot.handleUpdate(commandUpdate(2, privateUserId, "/quests"));
     let menuMessageId = latestMessageId(telegram.calls);
