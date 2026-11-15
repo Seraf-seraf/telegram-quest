@@ -16,6 +16,15 @@ describe("private quest callback protocol", () => {
       { kind: "start", questId: "quest-две-двери" },
       { kind: "sessions" },
       { kind: "sessions_page", cursor: "session-cursor" },
+      { kind: "genres_page", page: 2 },
+      { kind: "genre", key: "abcdefghijk", genrePage: 2 },
+      { kind: "quests_page", page: 3, genreKey: "abcdefghijk", genrePage: 2 },
+      { kind: "quests_page", page: 1, genreKey: null, genrePage: 1 },
+      { kind: "quest_card", questId: "q".repeat(32), catalogPage: 2176782335, genreKey: "abcdefghijk", genrePage: 2176782335 },
+      { kind: "sessions_number_page", page: 3 },
+      { kind: "history_page", sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000", stateVersion: Number.MAX_SAFE_INTEGER, page: 3 },
+      { kind: "history_target", sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000", stateVersion: 4, targetStepNo: 12 },
+      { kind: "noop" },
       { kind: "session", sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000" },
       {
         kind: "choice",
@@ -72,6 +81,14 @@ describe("private quest callback protocol", () => {
       stateVersion: -1,
       choiceIndex: 0,
     })).toThrow(CallbackDataError);
+  });
+
+  it("keeps maximal new navigation payloads within Telegram's 64-byte limit", () => {
+    const callbacks: PrivateQuestCallback[] = [
+      { kind: "quest_card", questId: "q".repeat(32), catalogPage: 2176782335, genreKey: "abcdefghijk", genrePage: 2176782335 },
+      { kind: "history_page", sessionId: "b19c7550-3142-4a08-b0a5-3b18b9c40000", stateVersion: Number.MAX_SAFE_INTEGER, page: 2176782335 },
+    ];
+    for (const callback of callbacks) expect(Buffer.byteLength(encodePrivateQuestCallback(callback), "utf8")).toBeLessThanOrEqual(64);
   });
 
   it("returns null for malformed, non-canonical, unknown, and oversized callbacks", () => {

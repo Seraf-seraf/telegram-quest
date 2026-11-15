@@ -11,6 +11,14 @@ export type PrivateQuestCallback =
   | { kind: "start"; questId: string }
   | { kind: "sessions" }
   | { kind: "sessions_page"; cursor: string }
+  | { kind: "genres_page"; page: number }
+  | { kind: "genre"; key: string; genrePage: number }
+  | { kind: "quests_page"; page: number; genreKey: string | null; genrePage: number }
+  | { kind: "quest_card"; questId: string; catalogPage: number; genreKey: string | null; genrePage: number }
+  | { kind: "sessions_number_page"; page: number }
+  | { kind: "history_page"; sessionId: string; stateVersion: number; page: number }
+  | { kind: "history_target"; sessionId: string; stateVersion: number; targetStepNo: number }
+  | { kind: "noop" }
   | { kind: "session"; sessionId: string }
   | {
     kind: "choice";
@@ -89,6 +97,31 @@ function encodePositiveIndex(index: number): string {
   return index.toString(36);
 }
 
+const MAX_PAGE_NUMBER = 2_176_782_335; // 36^6 - 1 keeps the largest full-context callback within 64 bytes.
+
+function encodePage(page: number): string {
+  if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE_NUMBER) {
+    throw new CallbackDataError();
+  }
+  return page.toString(36);
+}
+
+function decodePage(token: string | undefined): number | null {
+  const page = token === undefined ? null : decodeIndex(token);
+  return page !== null && page >= 1 && page <= MAX_PAGE_NUMBER ? page : null;
+}
+
+function encodeCompactIdentifier(id: string, maximumLength: number): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(id) || id.length > maximumLength) throw new CallbackDataError();
+  return id;
+}
+
+function decodeCompactIdentifier(token: string | undefined, maximumLength: number): string | null {
+  return token !== undefined && token.length <= maximumLength && /^[A-Za-z0-9_-]+$/.test(token)
+    ? token
+    : null;
+}
+
 function decodeIndex(token: string | undefined): number | null {
   if (token === undefined || !/^(0|[1-9a-z][0-9a-z]*)$/.test(token)) {
     return null;
@@ -140,6 +173,30 @@ export function encodePrivateQuestCallback(callback: PrivateQuestCallback): stri
       break;
     case "sessions_page":
       data = `${CALLBACK_PROTOCOL_VERSION}:l:${encodeId(callback.cursor)}`;
+      break;
+    case "genres_page":
+      data = `${CALLBACK_PROTOCOL_VERSION}:g:${encodePage(callback.page)}`;
+      break;
+    case "genre":
+      data = `${CALLBACK_PROTOCOL_VERSION}:G:${encodeCompactIdentifier(callback.key, 11)}:${encodePage(callback.genrePage)}`;
+      break;
+    case "quests_page":
+      data = `${CALLBACK_PROTOCOL_VERSION}:Q:${encodePage(callback.page)}:${callback.genreKey === null ? "-" : encodeCompactIdentifier(callback.genreKey, 11)}:${encodePage(callback.genrePage)}`;
+      break;
+    case "quest_card":
+      data = `${CALLBACK_PROTOCOL_VERSION}:C:${encodeCompactIdentifier(callback.questId, 32)}:${encodePage(callback.catalogPage)}:${callback.genreKey === null ? "-" : encodeCompactIdentifier(callback.genreKey, 11)}:${encodePage(callback.genrePage)}`;
+      break;
+    case "sessions_number_page":
+      data = `${CALLBACK_PROTOCOL_VERSION}:L:${encodePage(callback.page)}`;
+      break;
+    case "history_page":
+      data = `${CALLBACK_PROTOCOL_VERSION}:H:${encodeCompactIdentifier(callback.sessionId, 36)}:${encodeIndex(callback.stateVersion)}:${encodePage(callback.page)}`;
+      break;
+    case "history_target":
+      data = `${CALLBACK_PROTOCOL_VERSION}:J:${encodeCompactIdentifier(callback.sessionId, 36)}:${encodeIndex(callback.stateVersion)}:${encodePositiveIndex(callback.targetStepNo)}`;
+      break;
+    case "noop":
+      data = `${CALLBACK_PROTOCOL_VERSION}:n`;
       break;
     case "session":
       data = `${CALLBACK_PROTOCOL_VERSION}:o:${encodeId(callback.sessionId)}`;
@@ -219,6 +276,49 @@ export function parsePrivateQuestCallback(data: unknown): PrivateQuestCallback |
   }
 
   switch (operation) {
+    case "g": {
+      if (parts.length !== 3) return null;
+      const page = decodePage(parts[2]);
+      return page === null ? null : { kind: "genres_page", page };
+    }
+    case "G": {
+      if (parts.length !== 4) return null;
+      const key = decodeCompactIdentifier(parts[2], 11);
+      const genrePage = decodePage(parts[3]);
+      return key === null || key.length !== 11 || genrePage === null ? null : { kind: "genre", key, genrePage };
+    }
+    case "Q":
+    case "C": {
+      if (parts.length !== (operation === "Q" ? 5 : 6)) return null;
+      const page = decodePage(parts[operation === "Q" ? 2 : 3]);
+      const id = operation === "Q" ? null : decodeCompactIdentifier(parts[2], 32);
+      const genreToken = parts[operation === "Q" ? 3 : 4];
+      const genreKey = genreToken === "-" ? null : decodeCompactIdentifier(genreToken, 11);
+      const genrePage = decodePage(parts[operation === "Q" ? 4 : 5]);
+      if (page === null || genrePage === null || (genreToken !== "-" && (genreKey === null || genreKey.length !== 11))) return null;
+      return operation === "Q"
+        ? { kind: "quests_page", page, genreKey, genrePage }
+        : id === null ? null : { kind: "quest_card", questId: id, catalogPage: page, genreKey, genrePage };
+    }
+    case "L": {
+      if (parts.length !== 3) return null;
+      const page = decodePage(parts[2]);
+      return page === null ? null : { kind: "sessions_number_page", page };
+    }
+    case "H":
+    case "J": {
+      if (parts.length !== 5) return null;
+      const sessionId = decodeCompactIdentifier(parts[2], 36);
+      const stateVersion = decodeIndex(parts[3]);
+      const value = operation === "H" ? decodePage(parts[4]) : decodeIndex(parts[4]);
+      return sessionId === null || stateVersion === null || value === null || (operation === "J" && value < 1)
+        ? null
+        : operation === "H"
+          ? { kind: "history_page", sessionId, stateVersion, page: value }
+          : { kind: "history_target", sessionId, stateVersion, targetStepNo: value };
+    }
+    case "n":
+      return parts.length === 2 ? { kind: "noop" } : null;
     case "m":
       return parts.length === 2 ? { kind: "menu" } : null;
     case "q":

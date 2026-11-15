@@ -5,6 +5,17 @@ import { SessionError } from "../../app/session-store.js";
 import type { QuestCatalog } from "../../app/quest-catalog.js";
 import type { SessionService } from "../../app/sessions.js";
 import {
+  genreListView,
+  historyView,
+  mainMenuView,
+  questCardView,
+  questListView,
+  sessionsView,
+  type MenuAction,
+  type MenuView,
+} from "../../app/menu.js";
+import { createPage } from "../../app/pagination.js";
+import {
   CallbackDataError,
   encodePrivateQuestCallback,
   parsePrivateQuestCallback,
@@ -26,7 +37,7 @@ export interface PrivateQuestApplication {
     SessionService,
     "applyDecision" | "createSession" | "getSession" | "listOwnedSessions" | "startSession"
       | "listTurns" | "pauseSession" | "resumeSession" | "stopSession"
-      | "restartSession" | "rewindSession"
+      | "restartSession" | "rewindSession" | "listOwnedSessionsPage" | "listTurnSummariesPage"
   >;
 }
 
@@ -44,7 +55,9 @@ type SessionControlCallback = Extract<
       | "restart_confirm"
       | "rewind_list"
       | "rewind_prompt"
-      | "rewind_confirm";
+      | "rewind_confirm"
+      | "history_page"
+      | "history_target";
   }
 >;
 type FailurePhase =
@@ -107,10 +120,60 @@ function addButton(
 }
 
 function mainMenuKeyboard(): InlineKeyboard {
+  return keyboardForMenuView(mainMenuView());
+}
+
+function callbackForMenuAction(action: MenuAction): PrivateQuestCallback {
+  switch (action.kind) {
+    case "menu": return { kind: "menu" };
+    case "genres_page": return { kind: "genres_page", page: action.page };
+    case "genre": return { kind: "genre", key: action.key, genrePage: action.genrePage };
+    case "quests_page": return {
+      kind: "quests_page", page: action.page, genreKey: action.genreKey, genrePage: action.genrePage,
+    };
+    case "quest_card": return {
+      kind: "quest_card", questId: action.questId, catalogPage: action.catalogPage,
+      genreKey: action.genreKey, genrePage: action.genrePage,
+    };
+    case "start_quest": return { kind: "start", questId: action.questId };
+    case "sessions_page": return { kind: "sessions_number_page", page: action.page };
+    case "session": return { kind: "session", sessionId: action.sessionId };
+    case "manage": return { kind: "manage", sessionId: action.sessionId, stateVersion: action.stateVersion };
+    case "history_page": return {
+      kind: "history_page", sessionId: action.sessionId, stateVersion: action.stateVersion, page: action.page,
+    };
+    case "history_target": return {
+      kind: "history_target", sessionId: action.sessionId, stateVersion: action.stateVersion,
+      targetStepNo: action.targetStepNo,
+    };
+    case "pause": return { kind: "pause", sessionId: action.sessionId, stateVersion: action.stateVersion };
+    case "resume": return { kind: "resume", sessionId: action.sessionId, stateVersion: action.stateVersion };
+    case "stop_prompt": return { kind: "stop_prompt", sessionId: action.sessionId, stateVersion: action.stateVersion };
+    case "restart_prompt": return { kind: "restart_prompt", sessionId: action.sessionId, stateVersion: action.stateVersion };
+    case "noop": return { kind: "noop" };
+  }
+}
+
+function keyboardForMenuView(view: MenuView): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  addButton(keyboard, "Квесты", { kind: "quests" });
-  addButton(keyboard, "Мои прохождения", { kind: "sessions" });
+  for (const row of view.rows) {
+    for (const button of row) {
+      const data = callbackData(callbackForMenuAction(button.action));
+      if (data !== null) keyboard.text(buttonText(button.text), data);
+    }
+    keyboard.row();
+  }
   return keyboard;
+}
+
+async function showMenuView(
+  context: Context,
+  application: PrivateQuestApplication,
+  view: MenuView,
+  references: readonly string[] = [],
+  questId: string | null = null,
+): Promise<void> {
+  await showResolvedScreen(context, application, questId, view.content.text, references, keyboardForMenuView(view));
 }
 
 function sessionMenuKeyboard(session: Session): InlineKeyboard {
@@ -200,14 +263,7 @@ async function showMainMenu(
   context: Context,
   application: PrivateQuestApplication,
 ): Promise<void> {
-  await showResolvedScreen(
-    context,
-    application,
-    null,
-    "Личный квест. Выберите действие.",
-    ["menu.main.banner"],
-    mainMenuKeyboard(),
-  );
+  await showMenuView(context, application, mainMenuView(), ["menu.main.banner"]);
 }
 
 function statusLabel(status: string): string {
@@ -251,50 +307,52 @@ function createChoiceKeyboard(session: Session): {
 async function showQuestList(
   context: Context,
   application: PrivateQuestApplication,
+  pageNumber: number,
+  genreKey: string | null,
+  genrePage: number,
+  staleGenre = false,
 ): Promise<void> {
-  const quests = await application.catalog.listAvailableQuests();
-  const keyboard = new InlineKeyboard();
-  let skippedButtons = 0;
-
-  for (const quest of quests) {
-    if (!addButton(keyboard, quest.title, { kind: "quest", questId: quest.id })) {
-      skippedButtons += 1;
-    }
+  const genre = genreKey === null ? undefined : await application.catalog.resolveGenreKey(genreKey);
+  if (genreKey !== null && genre === null) {
+    const view = genreListView(await application.catalog.listGenresPage(genrePage));
+    view.content.text = `Жанр больше недоступен. Выберите другой.\n\n${view.content.text}`;
+    await showMenuView(context, application, view);
+    return;
   }
-  addButton(keyboard, "В меню", { kind: "menu" });
-
-  let text = quests.length === 0 ? "Доступных квестов пока нет." : "Выберите квест.";
-  if (skippedButtons > 0) {
-    text += " Некоторые квесты нельзя открыть из-за длины их идентификатора.";
-  }
-  await showResolvedScreen(context, application, null, text, ["menu.quests.banner"], keyboard);
+  const page = await application.catalog.listQuestsPage(pageNumber, genre === null ? undefined : genre);
+  const view = questListView(page, genreKey, genrePage);
+  if (staleGenre) view.content.text = `Жанр больше недоступен. Выберите другой.\n\n${view.content.text}`;
+  await showMenuView(context, application, view, ["menu.quests.banner"]);
 }
 
 async function showQuestCard(
   context: Context,
   application: PrivateQuestApplication,
   questId: string,
+  catalogPage = 1,
+  genreKey: string | null = null,
+  genrePage = 1,
 ): Promise<void> {
   const quest = await application.catalog.getQuest(questId);
   if (quest === null || !quest.available) {
-    const keyboard = mainMenuKeyboard();
-    await showScreen(context, "Квест больше недоступен. Откройте каталог заново.", keyboard);
+    await showQuestList(context, application, catalogPage, genreKey, genrePage, true);
     return;
   }
+  await showMenuView(context, application, questCardView(quest, catalogPage, genreKey, genrePage), ["cover"], quest.id);
+}
 
-  const keyboard = new InlineKeyboard();
-  addButton(keyboard, "Начать прохождение", { kind: "start", questId: quest.id });
-  addButton(keyboard, "Назад к квестам", { kind: "quests" });
-  addButton(keyboard, "В меню", { kind: "menu" });
+async function showGenres(context: Context, application: PrivateQuestApplication, page: number): Promise<void> {
+  await showMenuView(context, application, genreListView(await application.catalog.listGenresPage(page)));
+}
 
-  await showResolvedScreen(
-    context,
-    application,
-    quest.id,
-    `${quest.title}\nЖанр: ${quest.genre}\n\n${quest.description}`,
-    ["cover"],
-    keyboard,
-  );
+async function showQuestPage(
+  context: Context,
+  application: PrivateQuestApplication,
+  page: number,
+  genreKey: string | null,
+  genrePage: number,
+): Promise<void> {
+  await showQuestList(context, application, page, genreKey, genrePage);
 }
 
 async function showSessions(
@@ -329,6 +387,16 @@ async function showSessions(
     text += " Некоторые прохождения нельзя открыть из-за длины их идентификатора.";
   }
   await showResolvedScreen(context, application, null, text, ["menu.sessions.banner"], keyboard);
+}
+
+async function showSessionsPage(
+  context: Context,
+  application: PrivateQuestApplication,
+  owner: { type: "user"; id: string },
+  page: number,
+): Promise<void> {
+  const result = await application.sessions.listOwnedSessionsPage(owner, page);
+  await showMenuView(context, application, sessionsView(result), ["menu.sessions.banner"]);
 }
 
 async function sendSessionOutput(
@@ -536,42 +604,25 @@ async function showRewindConfirmation(
 
 async function showSessionHistory(
   context: Context,
+  application: PrivateQuestApplication,
+  owner: { type: "user"; id: string },
   session: Session,
-  turns: Awaited<ReturnType<SessionService["listTurns"]>>,
+  pageNumber: number,
 ): Promise<void> {
-  const keyboard = new InlineKeyboard();
   const canRewind = session.status === "active" || session.status === "paused";
-  for (const turn of turns) {
-    if (canRewind) {
-      addButton(keyboard, `Ход ${turn.stepNumber}: ${historyDescription(turn.sceneText)}`, {
-        kind: "rewind_prompt",
-        sessionId: session.id,
-        stateVersion: session.stateVersion,
-        targetStepNo: turn.stepNumber,
-      });
-    }
-  }
-  addButton(keyboard, "Назад к управлению", {
-    kind: "manage",
-    sessionId: session.id,
-    stateVersion: session.stateVersion,
-  });
-
-  const historyText = turns.map((turn) =>
-    `Ход ${turn.stepNumber}: ${historyDescription(turn.sceneText)}`
-  ).join("\n");
-  await showScreen(
-    context,
-    historyText.length === 0 ? "История ходов пуста." : `История прохождения:\n${historyText}`,
-    keyboard,
-  );
+  const page = await application.sessions.listTurnSummariesPage(owner, session.id, pageNumber);
+  await showMenuView(context, application, historyView(page, session.id, session.stateVersion, canRewind));
 }
 
 function failurePhase(callback: PrivateQuestCallback): FailurePhase {
   switch (callback.kind) {
     case "sessions":
     case "sessions_page":
+    case "sessions_number_page":
       return "sessions";
+    case "history_page":
+    case "history_target":
+      return "session_history";
     case "session":
       return "session_open";
     case "choice":
@@ -587,12 +638,19 @@ function failurePhase(callback: PrivateQuestCallback): FailurePhase {
     case "rewind_list":
     case "rewind_prompt":
     case "rewind_confirm":
+    case "history_page":
+    case "history_target":
       return "session_history";
     case "start":
       return "session_create";
     case "menu":
     case "quests":
     case "quest":
+    case "genres_page":
+    case "genre":
+    case "quests_page":
+    case "quest_card":
+    case "noop":
       return "catalog";
   }
 }
@@ -620,6 +678,8 @@ function isSessionControlCallback(callback: PrivateQuestCallback): callback is S
     case "rewind_list":
     case "rewind_prompt":
     case "rewind_confirm":
+    case "history_page":
+    case "history_target":
       return true;
     default:
       return false;
@@ -753,11 +813,15 @@ async function handleSessionControlCallback(
           return;
         }
       case "rewind_list": {
-        const turns = await application.sessions.listTurns(owner, session.id);
         await answer();
-        await showSessionHistory(context, session, turns);
+        await showSessionHistory(context, application, owner, session, 1);
         return;
       }
+      case "history_page":
+        await answer();
+        await showSessionHistory(context, application, owner, session, callback.page);
+        return;
+      case "history_target":
       case "rewind_prompt": {
         if (session.status !== "active" && session.status !== "paused") {
           await answer(refreshText);
@@ -927,6 +991,7 @@ async function handleCallback(
   }
 
   await context.answerCallbackQuery();
+  if (callback.kind === "noop") return;
 
   let activePhase = failurePhase(callback);
   try {
@@ -936,10 +1001,28 @@ async function handleCallback(
         await showMainMenu(context, application);
         return;
       case "quests":
-        await showQuestList(context, application);
+        await showQuestPage(context, application, 1, null, 1);
         return;
       case "quest":
         await showQuestCard(context, application, callback.questId);
+        return;
+      case "genres_page":
+        await showGenres(context, application, callback.page);
+        return;
+      case "genre": {
+        const genre = await application.catalog.resolveGenreKey(callback.key);
+        if (genre === null) {
+          await showGenres(context, application, callback.genrePage);
+          return;
+        }
+        await showQuestPage(context, application, 1, callback.key, callback.genrePage);
+        return;
+      }
+      case "quests_page":
+        await showQuestPage(context, application, callback.page, callback.genreKey, callback.genrePage);
+        return;
+      case "quest_card":
+        await showQuestCard(context, application, callback.questId, callback.catalogPage, callback.genreKey, callback.genrePage);
         return;
       case "start": {
         activePhase = "session_create";
@@ -979,10 +1062,13 @@ async function handleCallback(
         return;
       }
       case "sessions":
-        await showSessions(context, application, owner, null);
+        await showSessionsPage(context, application, owner, 1);
         return;
       case "sessions_page":
         await showSessions(context, application, owner, callback.cursor);
+        return;
+      case "sessions_number_page":
+        await showSessionsPage(context, application, owner, callback.page);
         return;
       case "session":
         activePhase = "session_open";
@@ -1019,9 +1105,9 @@ export function registerPrivateQuestHandlers(
       }
       const application = await getApplication();
       if (command === "quests") {
-        await showQuestList(context, application);
+        await showQuestPage(context, application, 1, null, 1);
       } else {
-        await showSessions(context, application, owner, null);
+        await showSessionsPage(context, application, owner, 1);
       }
     } catch (error) {
       logFailure(logger, command === "sessions" ? "sessions" : "catalog", error);

@@ -357,14 +357,14 @@ describe("private quest Telegram handlers", () => {
     registerPrivateQuestHandlers(bot, getApplication, (event) => failures.push(event));
 
     await bot.handleUpdate(commandUpdate(1, privateUserId, "/start"));
-    expect(latestScreen(telegram.calls).payload.text).toBe("Личный квест. Выберите действие.");
+    expect(latestScreen(telegram.calls).payload.text).toBe("Telegram Quest\nЛичный интерактивный рассказ. Выберите раздел.");
     let messageId = latestMessageId(telegram.calls);
 
     await bot.handleUpdate(callbackUpdate(
       2,
       privateUserId,
       messageId,
-      buttonData(telegram.calls, "Квесты"),
+      buttonData(telegram.calls, "📚 Квесты"),
     ));
     await bot.handleUpdate(callbackUpdate(
       3,
@@ -376,7 +376,7 @@ describe("private quest Telegram handlers", () => {
       5,
       privateUserId,
       messageId,
-      buttonData(telegram.calls, "Начать прохождение"),
+      buttonData(telegram.calls, "▶ Начать прохождение"),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
 
@@ -404,7 +404,7 @@ describe("private quest Telegram handlers", () => {
       9,
       privateUserId,
       messageId,
-      buttonData(telegram.calls, "Начать прохождение"),
+      buttonData(telegram.calls, "▶ Начать прохождение"),
     ));
     expect((await app.sessions.listOwnedSessions(
       { type: "user", id: String(privateUserId) },
@@ -439,7 +439,7 @@ describe("private quest Telegram handlers", () => {
       12,
       privateUserId,
       latestMessageId(telegram.calls),
-      buttonData(telegram.calls, "Две двери · в процессе"),
+      buttonData(telegram.calls, `Две двери · ${String(firstSessionId).slice(0, 8)} · в процессе`),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
 
@@ -532,10 +532,150 @@ describe("private quest Telegram handlers", () => {
 
     await bot.handleUpdate(commandUpdate(1, privateUserId, "/quests"));
 
-    expect(latestScreen(telegram.calls).payload.text).toBe("Доступных квестов пока нет.");
+    expect(latestScreen(telegram.calls).payload.text).toBe("Квестов пока нет.");
     expect(JSON.stringify(latestScreen(telegram.calls).payload.reply_markup))
       .not.toContain("Две двери");
-    expect(buttonData(telegram.calls, "В меню")).toBeDefined();
+    expect(buttonData(telegram.calls, "⌂ В меню")).toBeDefined();
+  });
+
+  it("navigates genre, quest, and session pages while preserving the card return context", async () => {
+    const database = createMemoryDatabase();
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+    });
+    const story = await database.read((executor) => executor.get(
+      "SELECT story_json FROM quest WHERE id = ?", "telegram-quest-demo",
+    ));
+    if (typeof story?.story_json !== "string") throw new Error("Demo story is missing.");
+    const storyJson = story.story_json;
+    await database.write(async (executor) => {
+      for (let index = 1; index <= 5; index += 1) {
+        await executor.run(
+          `INSERT INTO quest (id, title, description, genre, available, story_json)
+           VALUES (?, ?, ?, ?, 1, ?)`,
+          `quest-${index}`,
+          `Quest ${index}`,
+          `Description ${index}`,
+          `Genre ${index}`,
+          storyJson,
+        );
+      }
+    });
+    for (let operationId = 1; operationId <= 6; operationId += 1) {
+      await app.sessions.createSession(
+        { type: "user", id: String(privateUserId) },
+        "telegram-quest-demo",
+        operationId,
+      );
+    }
+
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    const getApplication = vi.fn(async () => app);
+    registerPrivateQuestHandlers(bot, getApplication, () => undefined);
+    let updateId = 100;
+    const click = async (label: string): Promise<void> => {
+      const messageId = latestMessageId(telegram.calls);
+      await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, messageId, buttonData(telegram.calls, label)));
+    };
+
+    await bot.handleUpdate(commandUpdate(updateId++, privateUserId, "/menu"));
+    await click("🎭 Жанры");
+    await click("▶");
+    const secondGenreRow = ((latestScreen(telegram.calls).payload.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard[0] ?? [])[0];
+    if (secondGenreRow === undefined) throw new Error("Second genre page is empty.");
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), secondGenreRow.callback_data));
+    const genreQuestButton = (((latestScreen(telegram.calls).payload.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard[0] ?? [])[0]);
+    if (genreQuestButton === undefined) throw new Error("Filtered quest list is empty.");
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), genreQuestButton.callback_data));
+    await click("← К квестам");
+    await click("← К жанрам");
+    expect(JSON.stringify(latestScreen(telegram.calls).payload.reply_markup)).toContain(secondGenreRow.text);
+    expect(buttonData(telegram.calls, "2 / 2")).toBeDefined();
+
+    await bot.handleUpdate(commandUpdate(updateId++, privateUserId, "/quests"));
+    expect(buttonData(telegram.calls, "▶")).toBeDefined();
+    await click("▶");
+    expect(latestScreen(telegram.calls).payload.reply_markup).toBeDefined();
+    const cardButton = ((latestScreen(telegram.calls).payload.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard[0] ?? [])[0];
+    if (cardButton === undefined) throw new Error("Second catalog page is empty.");
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), cardButton.callback_data));
+    await click("← К квестам");
+    expect(buttonData(telegram.calls, "2 / 2")).toBeDefined();
+
+    await bot.handleUpdate(commandUpdate(updateId++, privateUserId, "/sessions"));
+    expect(buttonData(telegram.calls, "1 / 2")).toBeDefined();
+    await click("▶");
+    expect(latestScreen(telegram.calls).payload.text).toBe("Ваши личные прохождения:");
+  });
+
+  it("pages twelve turn summaries without changing game state and keeps rewind confirmation", async () => {
+    const database = createMemoryDatabase();
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+    });
+    const owner = { type: "user" as const, id: String(privateUserId) };
+    const created = await app.sessions.createSession(owner, "telegram-quest-demo", 901);
+    const started = await app.sessions.startSession(owner, created.id, created.stateVersion);
+    await database.write(async (executor) => {
+      await executor.run(
+        "UPDATE turn SET decision_choice_index = 0 WHERE session_id = ? AND step_no = 1",
+        started.id,
+      );
+      for (let step = 2; step <= 12; step += 1) {
+        await executor.run(
+          `INSERT INTO turn (id, session_id, step_no, ink_checkpoint_json, scene_text, choices_json, decision_choice_index)
+           VALUES (?, ?, ?, '{}', ?, '[{"index":0,"text":"Continue","tags":[]}]', ?)`,
+          `turn-${step}`,
+          started.id,
+          step,
+          `History scene ${step}`,
+          step === 12 ? null : 0,
+        );
+      }
+    });
+
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    const getApplication = vi.fn(async () => app);
+    registerPrivateQuestHandlers(bot, getApplication, () => undefined);
+    let updateId = 200;
+    const historyData = encodePrivateQuestCallback({
+      kind: "rewind_list",
+      sessionId: started.id,
+      stateVersion: started.stateVersion,
+    });
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, 999, historyData));
+    expect(latestScreen(telegram.calls).payload.text).toContain("1. A sign points toward two doors.");
+    expect(latestScreen(telegram.calls).payload.text).not.toContain("History scene 6");
+    expect(buttonData(telegram.calls, "1 / 3")).toBeDefined();
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "▶")));
+    expect(latestScreen(telegram.calls).payload.text).toContain("History scene 6");
+    expect(latestScreen(telegram.calls).payload.text).toContain("History scene 10");
+    expect(latestScreen(telegram.calls).payload.text).not.toContain("History scene 11");
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "▶")));
+    expect(latestScreen(telegram.calls).payload.text).toContain("History scene 12");
+    expect(buttonData(telegram.calls, "3 / 3")).toBeDefined();
+    const callsBeforeBoundaryNoop = telegram.calls.length;
+    getApplication.mockClear();
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "▶")));
+    expect(getApplication).not.toHaveBeenCalled();
+    expect(telegram.calls.filter((call) => call.method === "sendMessage" || call.method === "editMessageText" || call.method === "sendPhoto" || call.method === "editMessageMedia")).toHaveLength(
+      telegram.calls.slice(0, callsBeforeBoundaryNoop).filter((call) => call.method === "sendMessage" || call.method === "editMessageText" || call.method === "sendPhoto" || call.method === "editMessageMedia").length,
+    );
+    await bot.handleUpdate(callbackUpdate(updateId++, privateUserId, latestMessageId(telegram.calls), buttonData(telegram.calls, "12. History scene 12")));
+    expect(latestScreen(telegram.calls).payload.text).toContain("Откатиться к ходу 12");
+    expect((await app.sessions.getSession(owner, started.id)).stateVersion).toBe(started.stateVersion);
   });
 
   it("resolves menu, cover, current-turn, updated image, and final-scene metadata", async () => {
@@ -583,7 +723,7 @@ describe("private quest Telegram handlers", () => {
 
     await bot.handleUpdate(commandUpdate(1, privateUserId, "/start"));
     expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/main.jpg");
-    expect(latestScreen(telegram.calls).payload.caption).toBe("Личный квест. Выберите действие.");
+    expect(latestScreen(telegram.calls).payload.caption).toBe("Telegram Quest\nЛичный интерактивный рассказ. Выберите раздел.");
 
     await bot.handleUpdate(commandUpdate(2, privateUserId, "/quests"));
     let menuMessageId = latestMessageId(telegram.calls);
@@ -604,7 +744,7 @@ describe("private quest Telegram handlers", () => {
       4,
       privateUserId,
       cardMessageId,
-      buttonDataForMessage(telegram.calls, cardMessageId, "Начать прохождение"),
+      buttonDataForMessage(telegram.calls, cardMessageId, "▶ Начать прохождение"),
       "text",
     ));
     expect(telegram.calls.filter((call) => call.method === "deleteMessage")
@@ -636,7 +776,7 @@ describe("private quest Telegram handlers", () => {
       6,
       privateUserId,
       menuMessageId,
-      buttonData(telegram.calls, "Tagged story · в процессе"),
+      buttonData(telegram.calls, `Tagged story · ${String((await app.sessions.listOwnedSessions({ type: "user", id: String(privateUserId) }, 20, null)).sessions[0]?.id).slice(0, 8)} · в процессе`),
       "photo",
     ));
     sceneMessageId = latestMessageId(telegram.calls);
@@ -681,7 +821,7 @@ describe("private quest Telegram handlers", () => {
       12,
       privateUserId,
       menuMessageId,
-      buttonData(telegram.calls, "Начать прохождение"),
+      buttonData(telegram.calls, "▶ Начать прохождение"),
     ));
     const sceneMessageId = latestMessageId(telegram.calls);
     const choice = buttonDataForMessage(telegram.calls, sceneMessageId, "Take the left path");
@@ -749,7 +889,7 @@ describe("private quest Telegram handlers", () => {
         firstUpdateId + 3,
         userId,
         panelMessageId,
-        buttonData(telegram.calls, "Начать прохождение"),
+        buttonData(telegram.calls, "▶ Начать прохождение"),
       ));
       const screen = latestScreen(telegram.calls);
       return {
@@ -781,7 +921,7 @@ describe("private quest Telegram handlers", () => {
       105,
       privateUserId,
       sessionsPanelId,
-      buttonData(telegram.calls, "Две двери · в процессе"),
+      buttonData(telegram.calls, `Две двери · ${String((await application.sessions.listOwnedSessions({ type: "user", id: String(privateUserId) }, 20, null)).sessions[0]?.id).slice(0, 8)} · в процессе`),
     ));
     expect(latestScreen(telegram.calls).payload.text).toBe("A sign points toward two doors.\n");
     const firstSessionId = (await application.sessions.listOwnedSessions(
@@ -830,7 +970,7 @@ describe("private quest Telegram handlers", () => {
       108,
       privateUserId,
       restartedSessionsPanelId,
-      buttonData(telegram.calls, "Две двери · в процессе"),
+      buttonData(telegram.calls, `Две двери · ${firstSessionId.slice(0, 8)} · в процессе`),
     ));
     expect(latestScreen(telegram.calls).payload.text).toContain("The left path glows.");
     const secondSceneMessageId = latestMessageId(telegram.calls);
@@ -966,7 +1106,7 @@ describe("private quest Telegram handlers", () => {
     }
 
     await clickPanel("Две двери");
-    await clickPanel("Начать прохождение");
+    await clickPanel("▶ Начать прохождение");
     expect(storyStart).toHaveBeenCalledTimes(1);
 
     const session = (await app.sessions.listOwnedSessions(
@@ -1051,9 +1191,9 @@ describe("private quest Telegram handlers", () => {
 
     await clickPanel("Управление");
     await clickPanel("История ходов");
-    expect(latestScreen(telegram.calls).payload.text).toContain("Ход 1: A sign points toward two doors.");
-    expect(latestScreen(telegram.calls).payload.text).toContain("Ход 2: The left path glows.");
-    const firstTurnButton = "Ход 1: A sign points toward two doors.";
+    expect(latestScreen(telegram.calls).payload.text).toContain("1. A sign points toward two doors.");
+    expect(latestScreen(telegram.calls).payload.text).toContain("2. The left path glows.");
+    const firstTurnButton = "1. A sign points toward two doors.";
     await clickPanel(firstTurnButton);
     expect(latestScreen(telegram.calls).payload.text)
       .toContain("Откатиться к ходу 1: A sign points toward two doors.");
