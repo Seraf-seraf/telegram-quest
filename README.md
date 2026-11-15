@@ -80,7 +80,7 @@ npm run quest:publish -- ./books/two-doors --metadata-only
 npm run quest:publish -- --menu ./menu.json
 ```
 
-Production-сборка в Vercel применяет этот файл автоматически на этапе установки зависимостей. Preview-сборки не записывают метаданные в общую production-базу.
+У проекта Vercel настроен Install Command: при наличии Turso credentials он применяет этот файл после установки зависимостей. Preview-сборки без этих credentials не записывают метаданные в общую production-базу.
 
 Для проверки папки книги перед публикацией добавьте `--dry-run`. Этот режим собирает и запускает скомпилированный CLI, проверяет manifest и компилирует сюжет, но не подключается к базе и не требует Turso credentials. Для режима `--metadata-only --dry-run` файл `story.ink` не читается. Для реальной публикации задайте `TURSO_DATABASE_URL` и `TURSO_AUTH_TOKEN`; CLI требует готовую схему v4 и не запускает миграции самостоятельно. Миграции применяются при обычном bootstrap приложения.
 

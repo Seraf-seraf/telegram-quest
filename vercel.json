@@ -1,4 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "npm ci --include=dev && if [ \"$VERCEL_ENV\" = \"production\" ]; then npm run quest:publish -- --menu ./menu.json; fi"
-}
