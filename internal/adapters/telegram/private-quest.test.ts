@@ -1,5 +1,5 @@
 import { createClient, type Transaction } from "@libsql/client";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { Bot } from "grammy";
 import type { Update } from "grammy/types";
 import { tmpdir } from "node:os";
@@ -7,9 +7,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SqlExecutor, SqlRow, TursoDatabase } from "../turso/client.js";
 import { ensureSchema } from "../turso/migrate.js";
+import { compileInkStory } from "../ink/compiler.js";
 import { initializeApp } from "../../bootstrap.js";
 import { registerPrivateQuestHandlers } from "./private-quest.js";
 import { encodePrivateQuestCallback } from "./callbacks.js";
+import { resolveMenuCallbackData } from "./menu-presenter.js";
 
 const validEnv = {
   TURSO_DATABASE_URL: "libsql://quest-example.turso.io",
@@ -19,6 +21,7 @@ const privateUserId = 41;
 const FILE_DATABASE_FLOW_TIMEOUT_MS = 15_000;
 const openDatabases = new Set<TursoDatabase>();
 const temporaryDirectories: string[] = [];
+let nextTelegramMessageId = 100;
 
 interface TelegramCall {
   method: string;
@@ -97,6 +100,23 @@ async function createFileDatabase(): Promise<{ database: TursoDatabase; url: str
   return { database: createDatabase(url), url };
 }
 
+async function compileTaggedStory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "telegram-quest-story-"));
+  temporaryDirectories.push(directory);
+  await writeFile(join(directory, "story.ink"), [
+    "-> start",
+    "=== start",
+    "The tagged opening. # asset:opening_art",
+    "+ [Continue]",
+    "    -> ending",
+    "=== ending",
+    "The tagged ending. # asset:ending_art",
+    "-> END",
+    "",
+  ].join("\n"), "utf8");
+  return compileInkStory(directory);
+}
+
 afterEach(async () => {
   for (const database of openDatabases) {
     database.close();
@@ -114,7 +134,6 @@ function createTelegramApiMock(): {
   failNext: (method: string) => void;
 } {
   const calls: TelegramCall[] = [];
-  let nextMessageId = 100;
   const failedMethods: string[] = [];
 
   const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
@@ -143,12 +162,13 @@ function createTelegramApiMock(): {
       "answerCallbackQuery",
       "editMessageReplyMarkup",
       "sendMessageDraft",
+      "deleteMessage",
     ].includes(method)
       ? true
       : (() => {
         responseMessageId = typeof payload.message_id === "number"
           ? payload.message_id
-          : nextMessageId++;
+          : nextTelegramMessageId++;
         return {
           message_id: responseMessageId,
           date: 1,
@@ -163,7 +183,10 @@ function createTelegramApiMock(): {
             first_name: "Quest bot",
             username: "quest_test_bot",
           },
-          text: typeof payload.text === "string" ? payload.text : "",
+          ...(typeof payload.text === "string" ? { text: payload.text } : {}),
+          ...(method === "sendPhoto" || method === "editMessageMedia"
+            ? { photo: [{ file_id: "photo-file", file_unique_id: "photo-unique", width: 1, height: 1 }] }
+            : {}),
         };
       })();
     calls.push({ method, payload, responseMessageId });
@@ -249,6 +272,7 @@ function callbackUpdate(
   userId: number,
   messageId: number,
   data: string,
+  messageKind: "text" | "photo" = "text",
 ): Update {
   return {
     update_id: updateId,
@@ -261,7 +285,10 @@ function callbackUpdate(
         date: 1,
         chat: { id: userId, type: "private", first_name: "Quest player" },
         from: { id: 1, is_bot: true, first_name: "Quest bot", username: "quest_test_bot" },
-        text: "Current menu",
+        reply_markup: { inline_keyboard: [[{ text: "Action", callback_data: data }]] },
+        ...(messageKind === "photo"
+          ? { photo: [{ file_id: "photo-file", file_unique_id: "photo-unique", width: 1, height: 1 }] }
+          : { text: "Current menu" }),
       },
       data,
     },
@@ -270,7 +297,8 @@ function callbackUpdate(
 
 function latestScreen(calls: TelegramCall[]): TelegramCall {
   const screen = calls.filter((call) =>
-    call.method === "sendMessage" || call.method === "editMessageText").at(-1);
+    ["sendMessage", "sendPhoto", "editMessageText", "editMessageMedia", "editMessageCaption"]
+      .includes(call.method)).at(-1);
   if (screen === undefined) {
     throw new Error("No Telegram screen was sent.");
   }
@@ -295,7 +323,8 @@ function buttonDataForMessage(
   text: string,
 ): string {
   const screen = calls.filter((call) =>
-    (call.method === "sendMessage" || call.method === "editMessageText") &&
+    ["sendMessage", "sendPhoto", "editMessageText", "editMessageMedia", "editMessageCaption"]
+      .includes(call.method) &&
     (call.responseMessageId === messageId || Number(call.payload.message_id) === messageId)
   ).at(-1);
   const markup = screen?.payload.reply_markup as {
@@ -391,7 +420,7 @@ describe("private quest Telegram handlers", () => {
     await bot.handleUpdate(callbackUpdate(
       10,
       84,
-      latestMessageId(telegram.calls),
+      999_999,
       encodePrivateQuestCallback({ kind: "session", sessionId: firstSessionId }),
     ));
     expect(latestScreen(telegram.calls).payload.text)
@@ -494,6 +523,7 @@ describe("private quest Telegram handlers", () => {
         getQuest: app.catalog.getQuest.bind(app.catalog),
       },
       sessions: app.sessions,
+      resolveContent: app.resolveContent,
     }));
     registerPrivateQuestHandlers(bot, getApplication);
 
@@ -503,6 +533,183 @@ describe("private quest Telegram handlers", () => {
     expect(JSON.stringify(latestScreen(telegram.calls).payload.reply_markup))
       .not.toContain("Две двери");
     expect(buttonData(telegram.calls, "В меню")).toBeDefined();
+  });
+
+  it("resolves menu, cover, current-turn, updated image, and final-scene metadata", async () => {
+    const database = createMemoryDatabase();
+    const storyJson = await compileTaggedStory();
+    const longDescription = "🗝️".repeat(600);
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+      storySource: { load: async () => storyJson },
+    });
+    await database.write(async (executor) => {
+      await executor.run(
+        `INSERT INTO quest (id, title, description, genre, available, story_json)
+         VALUES (?, ?, ?, ?, 1, ?)`,
+        "tagged-story",
+        "Tagged story",
+        longDescription,
+        "Test",
+        storyJson,
+      );
+      const metadata = [
+        [null, "menu.main.banner", "https://assets.example/main.jpg"],
+        [null, "menu.quests.banner", "https://assets.example/quests.jpg"],
+        [null, "menu.sessions.banner", "https://assets.example/sessions.jpg"],
+        ["tagged-story", "cover", "https://assets.example/cover.jpg"],
+        ["tagged-story", "opening_art", "https://assets.example/opening-v1.jpg"],
+        ["tagged-story", "ending_art", "https://assets.example/ending.jpg"],
+      ] as const;
+      for (const [questId, name, value] of metadata) {
+        await executor.run(
+          `INSERT INTO content_metadata (quest_id, name, kind, value)
+           VALUES (?, ?, 'image', ?)`,
+          questId,
+          name,
+          value,
+        );
+      }
+    });
+
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    registerPrivateQuestHandlers(bot, async () => app);
+
+    await bot.handleUpdate(commandUpdate(1, privateUserId, "/start"));
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/main.jpg");
+    expect(latestScreen(telegram.calls).payload.caption).toBe("Личный квест. Выберите действие.");
+
+    await bot.handleUpdate(commandUpdate(2, privateUserId, "/quests"));
+    let menuMessageId = latestMessageId(telegram.calls);
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/quests.jpg");
+    await bot.handleUpdate(callbackUpdate(
+      3,
+      privateUserId,
+      menuMessageId,
+      buttonData(telegram.calls, "Tagged story"),
+      "photo",
+    ));
+    expect(telegram.calls.filter((call) => call.method === "editMessageMedia").at(-1)?.payload.media)
+      .toMatchObject({ media: "https://assets.example/cover.jpg" });
+    const cardMessageId = latestMessageId(telegram.calls);
+    expect(latestScreen(telegram.calls).method).toBe("sendMessage");
+
+    await bot.handleUpdate(callbackUpdate(
+      4,
+      privateUserId,
+      cardMessageId,
+      buttonDataForMessage(telegram.calls, cardMessageId, "Начать прохождение"),
+      "text",
+    ));
+    expect(telegram.calls.filter((call) => call.method === "deleteMessage")
+      .slice(-2).map((call) => Number(call.payload.message_id)))
+      .toEqual([menuMessageId, cardMessageId]);
+    let sceneMessageId = latestMessageId(telegram.calls);
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/opening-v1.jpg");
+    expect(latestScreen(telegram.calls).payload.caption).toBe("The tagged opening.\n");
+
+    const applyDecision = vi.spyOn(app.sessions, "applyDecision");
+    const owner = { type: "user" as const, id: String(privateUserId) };
+    const session = (await app.sessions.listOwnedSessions(owner, 20, null)).sessions[0];
+    if (session === undefined) {
+      throw new Error("The tagged story session was not created.");
+    }
+    await database.write((executor) => executor.run(
+      `UPDATE content_metadata
+          SET value = ?
+        WHERE quest_id = ? AND name = ?`,
+      "https://assets.example/opening-v2.jpg",
+      "tagged-story",
+      "opening_art",
+    ));
+
+    await bot.handleUpdate(commandUpdate(5, privateUserId, "/sessions"));
+    menuMessageId = latestMessageId(telegram.calls);
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/sessions.jpg");
+    await bot.handleUpdate(callbackUpdate(
+      6,
+      privateUserId,
+      menuMessageId,
+      buttonData(telegram.calls, "Tagged story · в процессе"),
+      "photo",
+    ));
+    sceneMessageId = latestMessageId(telegram.calls);
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/opening-v2.jpg");
+
+    await bot.handleUpdate(callbackUpdate(
+      7,
+      privateUserId,
+      sceneMessageId,
+      buttonDataForMessage(telegram.calls, sceneMessageId, "Continue"),
+      "photo",
+    ));
+    expect(latestScreen(telegram.calls).payload.photo).toBe("https://assets.example/ending.jpg");
+    expect(latestScreen(telegram.calls).payload.caption).toBe("The tagged ending.\n");
+    expect(applyDecision).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not repeat a saved choice or edit/delete its scene when photo delivery fails", async () => {
+    const database = createMemoryDatabase();
+    const app = await initializeApp(validEnv, {
+      createDatabase: () => database,
+      ensureSchema,
+      logFailure: () => undefined,
+    });
+    vi.spyOn(app, "resolveContent").mockImplementation(async (questId, text) =>
+      questId === null ? { text } : { text, imageUrl: "https://assets.example/scene.jpg" }
+    );
+    const telegram = createTelegramApiMock();
+    const bot = createTestBot(telegram.fetch);
+    const failures: Array<{ event: string; phase: string; code: string }> = [];
+    registerPrivateQuestHandlers(bot, async () => app, (event) => failures.push(event));
+
+    await bot.handleUpdate(commandUpdate(10, privateUserId, "/quests"));
+    const menuMessageId = latestMessageId(telegram.calls);
+    await bot.handleUpdate(callbackUpdate(
+      11,
+      privateUserId,
+      menuMessageId,
+      buttonData(telegram.calls, "Две двери"),
+    ));
+    await bot.handleUpdate(callbackUpdate(
+      12,
+      privateUserId,
+      menuMessageId,
+      buttonData(telegram.calls, "Начать прохождение"),
+    ));
+    const sceneMessageId = latestMessageId(telegram.calls);
+    const choice = buttonDataForMessage(telegram.calls, sceneMessageId, "Take the left path");
+    const applyDecision = vi.spyOn(app.sessions, "applyDecision");
+    telegram.failNext("sendPhoto");
+
+    await bot.handleUpdate(callbackUpdate(
+      13,
+      privateUserId,
+      sceneMessageId,
+      choice,
+      "photo",
+    ));
+
+    expect(applyDecision).toHaveBeenCalledTimes(1);
+    expect(latestScreen(telegram.calls).payload.text)
+      .toBe("Ход сохранён. Откройте /sessions, чтобы восстановить продолжение.");
+    expect(telegram.calls.some((call) =>
+      call.method === "deleteMessage" && Number(call.payload.message_id) === sceneMessageId
+    )).toBe(false);
+    expect(telegram.calls.some((call) =>
+      call.method === "editMessageText" && Number(call.payload.message_id) === sceneMessageId
+    )).toBe(false);
+    expect(failures).toContainEqual({
+      event: "telegram_quest.private_handler_failed",
+      phase: "scene",
+      code: "INTERNAL_ERROR",
+    });
+
+    await bot.handleUpdate(callbackUpdate(14, privateUserId, sceneMessageId, choice, "photo"));
+    expect(applyDecision).toHaveBeenCalledTimes(1);
   });
 
   it("plays both real Ink branches, rejects stale choices, and recovers after app restart", async () => {
@@ -807,7 +1014,8 @@ describe("private quest Telegram handlers", () => {
     )).stateVersion).toBe(2);
 
     await clickCallback(panelMessageId, originalManage);
-    expect(buttonDataForMessage(telegram.calls, panelMessageId, "Пауза")).toBe(
+    const pauseCallbackData = buttonDataForMessage(telegram.calls, panelMessageId, "Пауза");
+    expect(resolveMenuCallbackData(pauseCallbackData)).toBe(
       encodePrivateQuestCallback({ kind: "pause", sessionId: session.id, stateVersion: 2 }),
     );
     await clickPanel("Пауза");
@@ -891,7 +1099,9 @@ describe("private quest Telegram handlers", () => {
     )).stateVersion).toBe(6);
 
     await clickCallback(panelMessageId, staleManage);
-    expect(buttonDataForMessage(telegram.calls, panelMessageId, "Пауза")).toBe(
+    expect(resolveMenuCallbackData(
+      buttonDataForMessage(telegram.calls, panelMessageId, "Пауза"),
+    )).toBe(
       encodePrivateQuestCallback({ kind: "pause", sessionId: session.id, stateVersion: 6 }),
     );
     await clickPanel("Начать заново");

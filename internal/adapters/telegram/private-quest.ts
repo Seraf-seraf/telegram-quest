@@ -1,5 +1,6 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 import type { Session } from "../../domain/model.js";
+import { assetReferences, type ContentResolver } from "../../app/content.js";
 import { SessionError } from "../../app/session-store.js";
 import type { QuestCatalog } from "../../app/quest-catalog.js";
 import type { SessionService } from "../../app/sessions.js";
@@ -9,12 +10,18 @@ import {
   parsePrivateQuestCallback,
   type PrivateQuestCallback,
 } from "./callbacks.js";
+import {
+  getExistingMenuMessage,
+  presentMenu,
+  resolveMenuCallbackData,
+} from "./menu-presenter.js";
 import { sendScene } from "./scene-presenter.js";
 
 const PRIVATE_SESSION_PAGE_ITEMS = 20;
 
 export interface PrivateQuestApplication {
   catalog: QuestCatalog;
+  resolveContent: ContentResolver;
   sessions: Pick<
     SessionService,
     "applyDecision" | "createSession" | "getSession" | "listOwnedSessions" | "startSession"
@@ -152,17 +159,53 @@ async function showScreen(
   text: string,
   keyboard: InlineKeyboard,
 ): Promise<void> {
-  if (context.callbackQuery?.message !== undefined) {
-    await context.editMessageText(text, { reply_markup: keyboard });
-  } else {
-    await context.reply(text, { reply_markup: keyboard });
+  const chatId = context.chatId;
+  if (chatId === undefined) {
+    throw new SessionError("INVALID_TRANSITION", "Private chat is unavailable.");
   }
+  await presentMenu(context.api, chatId, currentMenuMessage(context), { text }, keyboard);
 }
 
-async function showMainMenu(context: Context): Promise<void> {
-  await showScreen(
+function currentMenuMessage(context: Context) {
+  const message = context.callbackQuery?.message;
+  const chatId = context.chatId;
+  if (message === undefined || chatId === undefined) {
+    return undefined;
+  }
+  return getExistingMenuMessage(
+    chatId,
+    message.message_id,
+    "photo" in message,
+    context.callbackQuery?.data,
+  );
+}
+
+async function showResolvedScreen(
+  context: Context,
+  application: PrivateQuestApplication,
+  questId: string | null,
+  text: string,
+  references: readonly string[],
+  keyboard: InlineKeyboard,
+): Promise<void> {
+  const chatId = context.chatId;
+  if (chatId === undefined) {
+    throw new SessionError("INVALID_TRANSITION", "Private chat is unavailable.");
+  }
+  const view = await application.resolveContent(questId, text, references);
+  await presentMenu(context.api, chatId, currentMenuMessage(context), view, keyboard);
+}
+
+async function showMainMenu(
+  context: Context,
+  application: PrivateQuestApplication,
+): Promise<void> {
+  await showResolvedScreen(
     context,
+    application,
+    null,
     "Личный квест. Выберите действие.",
+    ["menu.main.banner"],
     mainMenuKeyboard(),
   );
 }
@@ -224,7 +267,7 @@ async function showQuestList(
   if (skippedButtons > 0) {
     text += " Некоторые квесты нельзя открыть из-за длины их идентификатора.";
   }
-  await showScreen(context, text, keyboard);
+  await showResolvedScreen(context, application, null, text, ["menu.quests.banner"], keyboard);
 }
 
 async function showQuestCard(
@@ -244,7 +287,14 @@ async function showQuestCard(
   addButton(keyboard, "Назад к квестам", { kind: "quests" });
   addButton(keyboard, "В меню", { kind: "menu" });
 
-  await showScreen(context, `${quest.title}\nЖанр: ${quest.genre}\n\n${quest.description}`, keyboard);
+  await showResolvedScreen(
+    context,
+    application,
+    quest.id,
+    `${quest.title}\nЖанр: ${quest.genre}\n\n${quest.description}`,
+    ["cover"],
+    keyboard,
+  );
 }
 
 async function showSessions(
@@ -278,11 +328,12 @@ async function showSessions(
   if (skippedButtons > 0) {
     text += " Некоторые прохождения нельзя открыть из-за длины их идентификатора.";
   }
-  await showScreen(context, text, keyboard);
+  await showResolvedScreen(context, application, null, text, ["menu.sessions.banner"], keyboard);
 }
 
 async function sendSessionOutput(
   context: Context,
+  application: PrivateQuestApplication,
   session: Session,
   updateId: number,
 ): Promise<void> {
@@ -293,7 +344,12 @@ async function sendSessionOutput(
 
   if (session.status === "completed") {
     if (session.finalScene !== null) {
-      await sendScene(context.api, chatId, session.finalScene.text, updateId);
+      const view = await application.resolveContent(
+        session.questId,
+        session.finalScene.text,
+        assetReferences(session.finalScene.tags),
+      );
+      await sendScene(context.api, chatId, view, updateId);
     }
     return;
   }
@@ -308,17 +364,27 @@ async function sendSessionOutput(
     if (skippedChoices > 0) {
       throw new CallbackDataError();
     }
+    const view = await application.resolveContent(
+      session.questId,
+      turn.sceneText,
+      assetReferences(turn.sceneTags),
+    );
     await sendScene(
       context.api,
       chatId,
-      turn.sceneText,
+      view,
       updateId,
       keyboard.inline_keyboard.length === 0 ? undefined : keyboard,
     );
     return;
   }
 
-  await sendScene(context.api, chatId, turn.sceneText, updateId);
+  const view = await application.resolveContent(
+    session.questId,
+    turn.sceneText,
+    assetReferences(turn.sceneTags),
+  );
+  await sendScene(context.api, chatId, view, updateId);
 }
 
 async function showSession(
@@ -347,7 +413,7 @@ async function showSession(
     `${title}\nСтатус: ${statusLabel(session.status)}\n\n${sessionMessage}`,
     sessionMenuKeyboard(session),
   );
-  await sendSessionOutput(context, session, updateId);
+  await sendSessionOutput(context, application, session, updateId);
 }
 
 function sessionControlsKeyboard(session: Session): InlineKeyboard {
@@ -812,7 +878,7 @@ async function handleChoiceCallback(
   }
 
   try {
-    await sendSessionOutput(context, updated, context.update.update_id);
+    await sendSessionOutput(context, application, updated, context.update.update_id);
   } catch (error) {
     logFailure(logger, "scene", error);
     try {
@@ -834,7 +900,18 @@ async function handleCallback(
     return;
   }
 
-  const callback = parsePrivateQuestCallback(context.callbackQuery?.data);
+  const callbackMessage = context.callbackQuery?.message;
+  const chatId = context.chatId;
+  const replyMarkup = callbackMessage !== undefined && "reply_markup" in callbackMessage
+    ? callbackMessage.reply_markup
+    : undefined;
+  const callbackData = callbackMessage === undefined || chatId === undefined
+    ? null
+    : resolveMenuCallbackData(
+      context.callbackQuery?.data,
+      replyMarkup,
+    );
+  const callback = parsePrivateQuestCallback(callbackData ?? undefined);
   if (callback === null) {
     await context.answerCallbackQuery({ text: "Меню обновилось. Откройте /menu" });
     return;
@@ -856,7 +933,7 @@ async function handleCallback(
     const application = await getApplication();
     switch (callback.kind) {
       case "menu":
-        await showMainMenu(context);
+        await showMainMenu(context, application);
         return;
       case "quests":
         await showQuestList(context, application);
@@ -936,7 +1013,8 @@ export function registerPrivateQuestHandlers(
 
     try {
       if (command === "menu") {
-        await showMainMenu(context);
+        const application = await getApplication();
+        await showMainMenu(context, application);
         return;
       }
       const application = await getApplication();

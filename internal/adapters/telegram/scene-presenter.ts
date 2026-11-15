@@ -1,6 +1,8 @@
 import type { InlineKeyboardMarkup } from "grammy/types";
+import type { ContentView } from "../../app/content.js";
 
 const TELEGRAM_MESSAGE_LIMIT_CODE_POINTS = 4096;
+const TELEGRAM_CAPTION_LIMIT_CODE_POINTS = 1024;
 const SAFE_SCENE_CHUNK_CODE_POINTS = 3900;
 const MAX_DRAFT_PREVIEWS = 3;
 const MAX_DRAFT_ID = 2_147_483_647;
@@ -10,6 +12,11 @@ export interface SceneTelegramApi {
     chatId: number | string,
     text: string,
     other?: { reply_markup: InlineKeyboardMarkup },
+  ): Promise<unknown>;
+  sendPhoto(
+    chatId: number | string,
+    photo: string,
+    other?: { caption?: string; reply_markup?: InlineKeyboardMarkup },
   ): Promise<unknown>;
   sendMessageDraft(chatId: number, draftId: number, text: string): Promise<unknown>;
 }
@@ -59,7 +66,11 @@ async function sendDraftPreviews(
   }
 }
 
-export async function sendScene(
+function codePointLength(text: string): number {
+  return [...text].length;
+}
+
+async function sendTextChunks(
   api: SceneTelegramApi,
   chatId: number | string,
   text: string,
@@ -88,4 +99,31 @@ export async function sendScene(
       await api.sendMessage(chatId, chunk, other);
     }
   }
+}
+
+export async function sendScene(
+  api: SceneTelegramApi,
+  chatId: number | string,
+  view: ContentView,
+  updateId: number,
+  keyboard?: InlineKeyboardMarkup,
+): Promise<void> {
+  if (view.imageUrl === undefined) {
+    await sendTextChunks(api, chatId, view.text, updateId, keyboard);
+    return;
+  }
+
+  if (codePointLength(view.text) <= TELEGRAM_CAPTION_LIMIT_CODE_POINTS) {
+    if (view.text.length > 0 && typeof chatId === "number") {
+      await sendDraftPreviews(api, chatId, draftIdFor(updateId, 0), view.text);
+    }
+    await api.sendPhoto(chatId, view.imageUrl, {
+      ...(view.text.length === 0 ? {} : { caption: view.text }),
+      ...(keyboard === undefined ? {} : { reply_markup: keyboard }),
+    });
+    return;
+  }
+
+  await api.sendPhoto(chatId, view.imageUrl);
+  await sendTextChunks(api, chatId, view.text, updateId, keyboard);
 }

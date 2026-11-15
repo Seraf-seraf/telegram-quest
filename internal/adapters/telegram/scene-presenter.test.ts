@@ -1,106 +1,103 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { InlineKeyboardMarkup } from "grammy/types";
-import {
-  sendScene,
-  splitSceneText,
-  type SceneTelegramApi,
-} from "./scene-presenter.js";
+import { sendScene, splitSceneText, type SceneTelegramApi } from "./scene-presenter.js";
 
-function createApi(): {
-  api: SceneTelegramApi;
-  sendMessage: ReturnType<typeof vi.fn>;
-  sendMessageDraft: ReturnType<typeof vi.fn>;
-} {
-  const sendMessage = vi.fn(async (
-    _chatId: number | string,
-    _text: string,
-    _other?: { reply_markup: InlineKeyboardMarkup },
-  ) => ({ message_id: 1 }));
-  const sendMessageDraft = vi.fn(async (
-    _chatId: number,
-    _draftId: number,
-    _text: string,
-  ) => true);
-  return {
-    api: { sendMessage, sendMessageDraft },
-    sendMessage,
-    sendMessageDraft,
-  };
+interface TelegramCall {
+  method: string;
+  text?: string;
+  photo?: string;
+  other?: { caption?: string; reply_markup?: InlineKeyboardMarkup };
 }
 
-describe("private scene presenter", () => {
-  it("keeps short scenes intact and splits long Unicode text on code-point boundaries", () => {
-    const shortText = "A 😀 story with *literal* <tags>";
-    expect(splitSceneText(shortText)).toEqual([shortText]);
-    const nearLimitText = "x".repeat(4096);
-    expect(splitSceneText(nearLimitText)).toEqual([nearLimitText]);
-    expect(splitSceneText("")).toEqual([]);
+function createApi(): { api: SceneTelegramApi; calls: TelegramCall[] } {
+  const calls: TelegramCall[] = [];
+  const api: SceneTelegramApi = {
+    sendMessage: async (_chatId, text, other) => {
+      calls.push({ method: "sendMessage", text, other });
+    },
+    sendPhoto: async (_chatId, photo, other) => {
+      calls.push({ method: "sendPhoto", photo, other });
+    },
+    sendMessageDraft: async (_chatId, _draftId, text) => {
+      calls.push({ method: "sendMessageDraft", text });
+    },
+  };
+  return { api, calls };
+}
 
-    const longText = `${"x".repeat(3899)}😀${"y😀".repeat(2200)}`;
-    const chunks = splitSceneText(longText);
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.join("")).toBe(longText);
-    expect(chunks.every((chunk) => [...chunk].length <= 3900)).toBe(true);
+const keyboard: InlineKeyboardMarkup = {
+  inline_keyboard: [[{ text: "Продолжить", callback_data: "q2:next" }]],
+};
+
+describe("scene presenter", () => {
+  it("sends a photo with a caption of 1024 Unicode code points and its keyboard", async () => {
+    const { api, calls } = createApi();
+    const caption = "😀".repeat(1024);
+
+    await sendScene(api, 41, { imageUrl: "https://assets.example/scene.jpg", text: caption }, 10, keyboard);
+
+    const photo = calls.find((call) => call.method === "sendPhoto");
+    expect(photo).toMatchObject({
+      photo: "https://assets.example/scene.jpg",
+      other: { caption, reply_markup: keyboard },
+    });
+    expect(calls.filter((call) => call.method === "sendMessage")).toHaveLength(0);
+    expect(calls.some((call) => call.other !== undefined && "parse_mode" in call.other)).toBe(false);
   });
 
-  it("shows bounded previews and always persists each complete scene chunk", async () => {
-    const { api, sendMessage, sendMessageDraft } = createApi();
-    const keyboard: InlineKeyboardMarkup = {
-      inline_keyboard: [[{ text: "Continue", callback_data: "v1:m" }]],
-    };
-    const text = "A *literal* <scene> 😀";
+  it("sends a 1025-code-point scene as full text after the photo with keyboard last", async () => {
+    const { api, calls } = createApi();
+    const text = "界".repeat(1025);
 
-    await sendScene(api, 41, text, 52, keyboard);
+    await sendScene(api, 41, { imageUrl: "https://assets.example/scene.jpg", text }, 11, keyboard);
 
-    expect(sendMessageDraft).toHaveBeenCalledTimes(3);
-    const codePoints = [...text];
-    expect(sendMessageDraft.mock.calls.map((call) => call[2])).toEqual(
-      [7, 14, codePoints.length].map((length) => codePoints.slice(0, length).join("")),
-    );
-    expect(sendMessage).toHaveBeenCalledWith(41, text, { reply_markup: keyboard });
-    expect(sendMessage.mock.calls.map((call) => call[1]).join("")).toBe(text);
+    expect(calls.find((call) => call.method === "sendPhoto")?.other).toBeUndefined();
+    const messages = calls.filter((call) => call.method === "sendMessage");
+    expect(messages.map((call) => call.text).join("")).toBe(text);
+    expect(messages.at(-1)?.other?.reply_markup).toEqual(keyboard);
   });
 
-  it("persists the final scene when a draft preview fails", async () => {
-    const { api, sendMessage, sendMessageDraft } = createApi();
-    sendMessageDraft.mockRejectedValueOnce(new Error("Draft is unavailable."));
-    const text = "The permanent final scene.";
+  it("keeps text intact at 4096 and 4097 Unicode code points", async () => {
+    for (const length of [4096, 4097]) {
+      const { api, calls } = createApi();
+      const text = "🧭".repeat(length);
 
-    await expect(sendScene(api, 41, text, 77)).resolves.toBeUndefined();
+      await sendScene(api, 41, { text }, 12, keyboard);
 
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledExactlyOnceWith(41, text);
+      const messages = calls.filter((call) => call.method === "sendMessage");
+      expect(messages.map((call) => call.text).join("")).toBe(text);
+      expect(messages.every((call) => [...(call.text ?? "")].length <= 4096)).toBe(true);
+      expect(messages.at(-1)?.other?.reply_markup).toEqual(keyboard);
+      expect(messages.slice(0, -1).every((call) => call.other === undefined)).toBe(true);
+    }
   });
 
-  it("sends every long-scene chunk and attaches choices only to the final chunk", async () => {
-    const { api, sendMessage, sendMessageDraft } = createApi();
-    const text = `${"🧭".repeat(3900)}x${"Ж".repeat(2100)}`;
-    const chunks = splitSceneText(text);
-    const keyboard: InlineKeyboardMarkup = {
-      inline_keyboard: [[{ text: "Continue", callback_data: "v1:m" }]],
-    };
+  it("sends photo first, then all long text chunks, retaining draft previews", async () => {
+    const { api, calls } = createApi();
+    const text = "🪵".repeat(4097);
 
-    await sendScene(api, 41, text, 91, keyboard);
+    await sendScene(api, 41, { imageUrl: "https://assets.example/scene.jpg", text }, 13, keyboard);
 
-    expect(sendMessage.mock.calls.map((call) => call[1])).toEqual(chunks);
-    expect(sendMessage.mock.calls.slice(0, -1).every((call) => call[2] === undefined)).toBe(true);
-    expect(sendMessage.mock.calls.at(-1)?.[2]).toEqual({ reply_markup: keyboard });
-    expect(sendMessageDraft).toHaveBeenCalledTimes(chunks.length * 3);
+    expect(calls[0]?.method).toBe("sendPhoto");
+    const messages = calls.filter((call) => call.method === "sendMessage");
+    expect(messages.map((call) => call.text).join("")).toBe(text);
+    expect(messages.every((call) => [...(call.text ?? "")].length <= 4096)).toBe(true);
+    expect(messages.at(-1)?.other?.reply_markup).toEqual(keyboard);
+    expect(calls.some((call) => call.method === "sendMessageDraft")).toBe(true);
   });
 
-  it("does not send an empty scene but still presents its choices", async () => {
-    const { api, sendMessage, sendMessageDraft } = createApi();
-    const keyboard: InlineKeyboardMarkup = {
-      inline_keyboard: [[{ text: "Continue", callback_data: "v1:m" }]],
-    };
+  it("preserves the existing text-only path and draft previews", async () => {
+    const { api, calls } = createApi();
+    const text = "A saved scene.";
 
-    await sendScene(api, 41, "", 88, keyboard);
+    await sendScene(api, 41, { text }, 14, keyboard);
 
-    expect(sendMessageDraft).not.toHaveBeenCalled();
-    expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
-      41,
-      "Выберите действие.",
-      { reply_markup: keyboard },
-    );
+    expect(calls.some((call) => call.method === "sendPhoto")).toBe(false);
+    expect(calls.some((call) => call.method === "sendMessageDraft")).toBe(true);
+    expect(calls.filter((call) => call.method === "sendMessage")).toEqual([
+      { method: "sendMessage", text, other: { reply_markup: keyboard } },
+    ]);
+    expect(splitSceneText("🧭".repeat(4097)).map((chunk) => [...chunk].length))
+      .toEqual([3900, 197]);
   });
 });
